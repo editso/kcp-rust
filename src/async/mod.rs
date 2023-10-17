@@ -31,6 +31,14 @@ pub trait AsyncRecvfrom {
     ) -> Pin<Box<dyn Future<Output = std::io::Result<(SocketAddr, Vec<u8>)>> + Send + 'static>>;
 }
 
+pub trait AsyncSend {
+    fn poll_send(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>>;
+}
+
 pub trait AsyncRecv {
     fn poll_recv(
         self: Pin<&mut Self>,

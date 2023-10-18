@@ -1,4 +1,9 @@
-use std::{future::Future, net::SocketAddr, pin::Pin, task::Context};
+use std::{
+    future::Future,
+    net::SocketAddr,
+    pin::Pin,
+    task::{Context, Poll},
+};
 
 pub trait AsyncRead {
     fn poll_read(
@@ -14,21 +19,28 @@ pub trait AsyncWrite {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> std::task::Poll<std::io::Result<usize>>;
+
+    fn poll_flush(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>>;
+
+    fn poll_close(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>>;
 }
 
 pub trait AsyncSendTo {
-    fn send_to(
+    fn poll_sendto(
         &mut self,
         addr: &SocketAddr,
         buf: Vec<u8>,
-    ) -> Pin<Box<dyn Future<Output = std::io::Result<()>> + Send + 'static>>;
+    ) -> std::task::Poll<std::io::Result<usize>>;
 }
 
 pub trait AsyncRecvfrom {
-    fn recv_from(
-        &mut self,
-        buf: Vec<u8>,
-    ) -> Pin<Box<dyn Future<Output = std::io::Result<(SocketAddr, Vec<u8>)>> + Send + 'static>>;
+    fn poll_recvfrom(&mut self) -> std::task::Poll<std::io::Result<(SocketAddr, Vec<u8>)>>;
 }
 
 pub trait AsyncSend {
@@ -59,6 +71,10 @@ pub struct Write<'a, W: AsyncWrite + Unpin> {
     #[pin]
     buf: &'a [u8],
     writer: &'a mut W,
+}
+
+pub struct PollFn<F> {
+    f: F,
 }
 
 pub trait AsyncReadExt: AsyncRead {
@@ -101,5 +117,24 @@ where
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> std::task::Poll<Self::Output> {
         let this = self.project();
         Pin::new(&mut **this.writer).poll_write(cx, &*this.buf)
+    }
+}
+
+pub fn poll_fn<F, O>(f: F) -> PollFn<F>
+where
+    F: FnMut(&mut Context<'_>) -> Poll<O>,
+{
+    PollFn { f }
+}
+
+impl<F, O> Future for PollFn<F>
+where
+    F: FnMut(&mut Context<'_>) -> Poll<O> + Unpin,
+    O: Unpin,
+{
+    type Output = O;
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> std::task::Poll<Self::Output> {
+        let f = &mut self.f;
+        f(cx)
     }
 }

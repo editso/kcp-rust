@@ -7,6 +7,7 @@ use std::sync::{Arc, RwLock};
 use std::sync::Mutex;
 use std::task::{Context, Poll};
 
+use crate::poller::KcpPoller;
 use crate::queue::Queue;
 use crate::r#async::{poll_fn, AsyncRead, AsyncRecv, AsyncSend, AsyncWrite, PollFn};
 use crate::{kcp, server};
@@ -45,6 +46,7 @@ pub struct ClientImpl<IO: Clone> {
     core: KcpCore,
 }
 
+
 impl<IO> KcpConnector<IO>
 where
     IO: Clone + AsyncSend + AsyncRecv + Unpin,
@@ -56,7 +58,7 @@ where
 
         let processors = vec![
             Processor(Box::pin(Self::run_async_write(snd_que, io.clone()))),
-            Processor(Box::pin(Self::run_async_read(manager))),
+            // Processor(Box::pin(Self::run_async_read(manager))),
             Processor(Box::pin(Self::run_async_update())),
         ];
 
@@ -75,14 +77,7 @@ where
             kcp: kcp::CB,
             user: *mut c_void,
         ) -> i32 {
-            unsafe {
-                match std::ptr::slice_from_raw_parts(data, len as usize).as_ref() {
-                    None => -1,
-                    Some(data) => {
-                        Box::leak(Box::<KcpManager>::from_raw(user as *mut KcpManager)).output(data)
-                    }
-                }
-            }
+            unimplemented!()
         }
 
         let kcp = kcp::Kcp::new::<KcpManager>(
@@ -112,9 +107,13 @@ where
     }
 
     async fn run_async_update() -> kcp::Result<()> {
-        unimplemented!()
+        let sessions = Vec::<KcpCore>::new();
+        let poller = KcpPoller::<KcpConv>::new();
+        Ok(())
     }
 }
+
+
 
 impl<IO> KcpConnector<IO>
 where

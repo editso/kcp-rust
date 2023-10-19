@@ -5,6 +5,8 @@ mod server;
 mod sync;
 mod queue;
 
+mod poller;
+
 use std::pin::Pin;
 
 use r#async::{AsyncRead, AsyncSend, AsyncWrite};

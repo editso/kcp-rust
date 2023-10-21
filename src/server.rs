@@ -9,8 +9,8 @@ pub struct ServerImpl{
 }
 
 impl KcpListener {
-    pub async fn new() {
-
+    pub fn new() -> Self{
+        unimplemented!()
     }
 
     pub async fn accept(&mut self) -> KcpStream<ServerImpl>{

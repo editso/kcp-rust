@@ -129,8 +129,8 @@ where
 
 impl<F, O> Future for PollFn<F>
 where
-    F: FnMut(&mut Context<'_>) -> Poll<O> + Unpin,
     O: Unpin,
+    F: FnMut(&mut Context<'_>) -> Poll<O> + Unpin
 {
     type Output = O;
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> std::task::Poll<Self::Output> {

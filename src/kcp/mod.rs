@@ -67,7 +67,7 @@ where
     }
 
     pub fn recv(&self, buf: &mut [u8]) -> error::Result<usize> {
-        let retval = unsafe { ikcp::send(self.ikcp, buf.as_mut_ptr(), buf.len() as i32) };
+        let retval = unsafe { ikcp::recv(self.ikcp, buf.as_mut_ptr(), buf.len() as i32) };
         Ok(retval as usize)
     }
 

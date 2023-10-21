@@ -1,11 +1,11 @@
 mod r#async;
 mod client;
 mod kcp;
-mod server;
-mod sync;
-mod queue;
-
 mod poller;
+mod queue;
+mod server;
+mod signal;
+mod sync;
 
 use std::pin::Pin;
 
@@ -56,11 +56,32 @@ where
 #[cfg(test)]
 mod tests {
     use std::pin::Pin;
+    use std::sync::Arc;
 
-    use crate::r#async::{AsyncReadExt, AsyncRecv, AsyncSend, AsyncSendTo};
+    use smol::future::FutureExt;
+    use smol::io;
+
+    use crate::client::Processor;
+    use crate::r#async::{AsyncReadExt, AsyncRecv, AsyncSend, AsyncSendTo, AsyncWriteExt};
+    use crate::{client, kcp, poller};
     use crate::{client::KcpConnector, server::KcpListener};
 
-    impl AsyncSend for smol::net::UdpSocket {
+    #[derive(Clone)]
+    pub struct UdpSocket {
+        inner: smol::net::UdpSocket,
+        reader_fut: Arc<std::sync::Mutex<Option<poller::BoxedFuture<io::Result<Vec<u8>>>>>>,
+    }
+
+    impl UdpSocket {
+        pub fn new(udp: smol::net::UdpSocket) -> Self {
+            Self {
+                inner: udp,
+                reader_fut: Default::default(),
+            }
+        }
+    }
+
+    impl AsyncSend for UdpSocket {
         fn poll_send(
             self: Pin<&mut Self>,
             cx: &mut std::task::Context<'_>,
@@ -71,17 +92,45 @@ mod tests {
         }
     }
 
-    impl AsyncRecv for smol::net::UdpSocket {
+    impl AsyncRecv for UdpSocket {
         fn poll_recv(
             self: Pin<&mut Self>,
             cx: &mut std::task::Context<'_>,
             buf: &mut [u8],
         ) -> std::task::Poll<std::io::Result<usize>> {
-            unimplemented!()
+            let mut this = self.reader_fut.lock().unwrap();
+
+            let mut fut = this.take().unwrap_or_else(|| {
+                let udp = self.inner.clone();
+                let mut buf = unsafe {
+                    let mut buf = Vec::with_capacity(buf.len());
+                    buf.set_len(buf.len());
+                    buf
+                };
+                Box::pin(async move {
+                    let n = udp.recv(&mut buf).await?;
+                    buf.truncate(n);
+                    std::io::Result::Ok(buf)
+                })
+            });
+
+            log::debug!("polling udp socket from smol");
+
+            match Pin::new(&mut fut).poll(cx) {
+                std::task::Poll::Ready(Err(e)) => std::task::Poll::Ready(Err(e)),
+                std::task::Poll::Pending => {
+                    *this = Some(fut);
+                    std::task::Poll::Pending
+                }
+                std::task::Poll::Ready(Ok(data)) => {
+                    buf[..data.len()].copy_from_slice(&data);
+                    std::task::Poll::Ready(Ok(data.len()))
+                }
+            }
         }
     }
 
-    impl AsyncSendTo for smol::net::UdpSocket {
+    impl AsyncSendTo for UdpSocket {
         fn poll_sendto(
             &mut self,
             addr: &std::net::SocketAddr,
@@ -91,16 +140,70 @@ mod tests {
         }
     }
 
+    struct KcpClientRuntime;
+
+    struct KcpRunner;
+
+    struct KcpTimer;
+
+    impl poller::Timer for KcpTimer {
+        fn sleep(&self, time: std::time::Duration) -> poller::BoxedFuture<()> {
+            Box::pin(async move {
+                smol::Timer::after(time).await;
+            })
+        }
+    }
+
+    impl client::Runner for KcpRunner {
+        type Err = io::Error;
+        fn call(process: Processor) -> std::result::Result<(), Self::Err> {
+            std::thread::Builder::new()
+                .name("processor[kcp]".into())
+                .spawn(move || {
+                    smol::block_on(async move {
+                        process.await.unwrap();
+                    })
+                })
+                .unwrap();
+
+            Ok(())
+        }
+    }
+
+    impl client::KcpRuntime for KcpClientRuntime {
+        type Err = io::Error;
+
+        type Runner = KcpRunner;
+
+        type Timer = KcpTimer;
+
+        fn timer() -> Self::Timer {
+            KcpTimer
+        }
+    }
+
     #[test]
-    fn test_kcp_client() -> std::io::Result<()> {
+    fn test_kcp_client() -> kcp::Result<()> {
         smol::block_on(async move {
-            let udp = smol::net::UdpSocket::bind("").await?;
+            env_logger::builder()
+                .filter_level(log::LevelFilter::Debug)
+                .init();
 
-            udp.connect("").await?;
+            log::debug!("start kcp client");
 
-            let mut kcp_connector = KcpConnector::new(udp);
+            let udp = smol::net::UdpSocket::bind("0.0.0.0:0").await?;
 
-            let kcp = kcp_connector.open().await.unwrap();
+            udp.connect("127.0.0.1:9999").await?;
+
+            let mut kcp_connector = KcpConnector::new::<KcpClientRuntime>(UdpSocket::new(udp))?;
+
+            let mut kcp = kcp_connector.open()?;
+
+            let mut buf = [0u8; 21];
+
+            let a = kcp.write(&mut buf).await.unwrap();
+
+            let a = kcp.read(&mut buf).await.unwrap();
 
             Ok(())
         })
@@ -111,9 +214,7 @@ mod tests {
         smol::block_on(async {
             let mut kcp_server = KcpListener::new();
 
-            loop {
-                // let mut stream = kcp_server.accept().await.unwrap();
-            }
+            loop {}
         })
     }
 }

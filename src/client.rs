@@ -1,27 +1,33 @@
 use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::future::Future;
+
 use std::pin::Pin;
-use std::sync::{Arc, RwLock};
+use std::sync::{self, Arc, RwLock};
 
 use std::sync::Mutex;
-use std::task::{Context, Poll};
+use std::task::{Context, Poll, Waker};
 
-use crate::poller::KcpPoller;
+use crate::poller::{self, KcpPoller, SafeKcp, Timer};
 use crate::queue::Queue;
 use crate::r#async::{poll_fn, AsyncRead, AsyncRecv, AsyncSend, AsyncWrite, PollFn};
-use crate::{kcp, server};
+use crate::{kcp, server, signal};
 
 use crate::{
     kcp::{ConvAllocator, Kcp},
     KcpStream,
 };
 
-#[derive(Clone)]
-struct KcpConv {}
+#[derive(Clone, Debug, Default)]
+struct KcpConv {
+    conv: Arc<Mutex<u32>>,
+}
 
 struct CoreImpl {
-    kcp: Kcp<KcpConv>,
+    kcp: SafeKcp<KcpConv>,
+    send_waker: Option<Waker>,
+    recv_waker: Option<Waker>,
+    close_waker: Option<Waker>,
 }
 
 struct ManagerImpl {}
@@ -32,45 +38,69 @@ struct KcpCore(Arc<Mutex<CoreImpl>>);
 #[derive(Clone)]
 struct KcpManager(Arc<Mutex<ManagerImpl>>);
 
-struct Processor(Pin<Box<dyn Future<Output = kcp::Result<()>> + 'static>>);
+pub struct Processor(Pin<Box<dyn Future<Output = kcp::Result<()>> + Send + 'static>>);
 
 pub struct KcpConnector<IO: Clone> {
     io: IO,
     allocate: KcpConv,
     manager: KcpManager,
-    processors: Vec<Processor>,
+    poller: KcpPoller<KcpConv>,
 }
 
-pub struct ClientImpl<IO: Clone> {
-    io: IO,
+pub struct ClientImpl {
     core: KcpCore,
 }
 
+pub trait Runner: Sized {
+    type Err;
+    fn call(process: Processor) -> std::result::Result<(), Self::Err>;
+}
+
+pub trait KcpRuntime: Sized {
+    type Err;
+
+    type Runner: Runner<Err = Self::Err>;
+
+    type Timer: poller::Timer + Send + 'static;
+
+    fn timer() -> Self::Timer;
+}
 
 impl<IO> KcpConnector<IO>
 where
     IO: Clone + AsyncSend + AsyncRecv + Unpin,
+    IO: Send + 'static,
 {
-    pub fn new(io: IO) -> KcpConnector<IO> {
-        let snd_que = Queue::<Vec<u8>>::new(1024);
+    pub fn new<Runtime>(io: IO) -> std::result::Result<KcpConnector<IO>, Runtime::Err>
+    where
+        Runtime: KcpRuntime,
+    {
+        // let run_fn = Runtime::runner();
 
-        let manager = KcpManager(todo!());
+        let snd_que = Queue::<Vec<u8>>::new(1024);
+        let poller = KcpPoller::new(Runtime::timer());
+
+        let manager = KcpManager(Arc::new(Mutex::new(ManagerImpl {})));
 
         let processors = vec![
+            Processor(Box::pin(Self::run_async_read(io.clone(), manager.clone()))),
+            Processor(Box::pin(Self::run_async_update(poller.clone()))),
             Processor(Box::pin(Self::run_async_write(snd_que, io.clone()))),
-            // Processor(Box::pin(Self::run_async_read(manager))),
-            Processor(Box::pin(Self::run_async_update())),
         ];
 
-        KcpConnector {
+        for process in processors {
+            Runtime::Runner::call(process)?;
+        }
+
+        Ok(KcpConnector {
             io,
             manager,
-            allocate: KcpConv {},
-            processors,
-        }
+            poller,
+            allocate: KcpConv::default(),
+        })
     }
 
-    pub async fn open(&mut self) -> kcp::Result<KcpStream<ClientImpl<IO>>> {
+    pub fn open(&mut self) -> kcp::Result<KcpStream<ClientImpl>> {
         extern "C" fn kcp_output_cb_impl(
             data: *const u8,
             len: i32,
@@ -90,14 +120,15 @@ where
 
         kcp.set_output(kcp_output_cb_impl);
 
-        let core = KcpCore(Arc::new(Mutex::new(CoreImpl { kcp })));
+        let kcp = SafeKcp::wrap(kcp);
+
+        self.poller.register(kcp.clone());
+
+        let core = KcpCore::new(kcp);
 
         self.manager.manage(core.clone());
 
-        Ok(KcpStream(ClientImpl {
-            io: self.io.clone(),
-            core,
-        }))
+        Ok(KcpStream(ClientImpl { core }))
     }
 
     fn kcp_cleanup(user: *mut c_void) {
@@ -106,52 +137,85 @@ where
         }
     }
 
-    async fn run_async_update() -> kcp::Result<()> {
-        let sessions = Vec::<KcpCore>::new();
-        let poller = KcpPoller::<KcpConv>::new();
-        Ok(())
+    async fn run_async_update(poller: KcpPoller<KcpConv>) -> kcp::Result<()> {
+        log::debug!("start kcp checker at {:?}", std::thread::current().id());
+        poller.await
     }
 }
-
-
 
 impl<IO> KcpConnector<IO>
 where
     IO: AsyncSend + Clone + Unpin,
 {
     async fn run_async_write(snd_que: Queue<Vec<u8>>, mut io: IO) -> kcp::Result<()> {
+        log::debug!("start kcp writer at {:?}", std::thread::current().name());
         loop {
-            let data = snd_que.recv().await.unwrap();
-            poll_fn(|cx| Pin::new(&mut io).poll_send(cx, &data))
-                .await
-                .unwrap();
+            let data = snd_que.recv().await?;
+            let _ = poll_fn(|cx| Pin::new(&mut io).poll_send(cx, &data)).await?;
         }
     }
 }
 
 impl<IO> KcpConnector<IO>
 where
+    IO: Send,
     IO: AsyncRecv + Clone + Unpin,
 {
     async fn run_async_read(mut io: IO, manager: KcpManager) -> kcp::Result<()> {
+        log::debug!("start kcp reader at {:?}", std::thread::current().name());
+
+        let mut pending_read = true;
+
+        let mut buf = {
+            let mut buf = Vec::with_capacity(1024);
+            unsafe {
+                buf.set_len(1024);
+            }
+            buf
+        };
+
         loop {
-            let mut buf = {
-                let mut buf = Vec::with_capacity(1024);
-                unsafe {
-                    buf.set_len(1024);
+            let poll_recv = poll_fn(|cx| {
+                if pending_read {
+                    Poll::Pending
+                } else {
+                    Pin::new(&mut io).poll_recv(cx, &mut buf)
                 }
-                buf
-            };
+            });
 
-            let size = poll_fn(|cx| Pin::new(&mut io).poll_recv(cx, &mut buf))
-                .await
-                .unwrap();
+            let poll_signal = poll_fn(|cx| {
+                if !pending_read {
+                    Poll::Ready(kcp::Result::Ok(1))
+                } else {
+                    Poll::Pending
+                }
+            });
 
-            let conv = kcp::Kcp::<KcpConv>::get_conv(&buf[..size]);
+            let signal = signal::poll_signal_or(poll_recv, poll_signal).await;
 
-            match manager.lookup(conv).input(&buf[..size]).await {
-                Ok(e) => {}
-                Err(e) => {}
+            match signal {
+                signal::Sig::Signal(sig) => {
+                    let sig = sig?;
+                    if sig == 1 {
+                        pending_read = true;
+                    }
+                }
+                signal::Sig::Data(data) => {
+                    let n = data?;
+                    let conv = kcp::Kcp::<KcpConv>::get_conv(&buf[..n]);
+
+                    match manager.lookup(conv) {
+                        None => {
+                            println!("warn: kcp not found");
+                        }
+                        Some(core) => {
+                            if let Err(e) = core.input(&buf[..n]).await {
+                                println!("{:?}", e);
+                                core.close();
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -160,28 +224,24 @@ where
 
 impl ConvAllocator for KcpConv {
     fn allocate(&mut self) -> kcp::Result<kcp::CONV_T> {
-        todo!()
+        let conv = self.conv.lock().unwrap();
+        Ok(*conv)
     }
 
-    fn deallocate(&mut self, conv: kcp::CONV_T) {
-        todo!()
-    }
+    fn deallocate(&mut self, conv: kcp::CONV_T) {}
 }
 
 impl Processor {
     fn stop(&mut self) {}
 }
 
-impl<IO> AsyncWrite for ClientImpl<IO>
-where
-    IO: Clone + AsyncSend + Unpin,
-{
+impl AsyncWrite for ClientImpl {
     fn poll_write(
-        self: std::pin::Pin<&mut Self>,
+        mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
         buf: &[u8],
     ) -> std::task::Poll<std::io::Result<usize>> {
-        unimplemented!()
+        self.core.poll_write(cx, buf)
     }
 
     fn poll_flush(
@@ -199,16 +259,13 @@ where
     }
 }
 
-impl<IO> AsyncRead for ClientImpl<IO>
-where
-    IO: Clone + AsyncRecv + Unpin,
-{
+impl AsyncRead for ClientImpl {
     fn poll_read(
-        self: std::pin::Pin<&mut Self>,
+        mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
         buf: &mut [u8],
     ) -> std::task::Poll<std::io::Result<usize>> {
-        unimplemented!()
+        self.core.poll_read(cx, buf)
     }
 }
 
@@ -216,12 +273,7 @@ impl<IO> Drop for KcpConnector<IO>
 where
     IO: Clone,
 {
-    fn drop(&mut self) {
-        self.processors.retain_mut(|processor| {
-            processor.stop();
-            false
-        })
-    }
+    fn drop(&mut self) {}
 }
 
 impl KcpManager {
@@ -233,15 +285,70 @@ impl KcpManager {
         0
     }
 
-    fn lookup(&self, conv: u32) -> KcpCore {
+    fn lookup(&self, conv: u32) -> Option<KcpCore> {
         unimplemented!()
     }
 }
 
 impl KcpCore {
+    fn new(kcp: SafeKcp<KcpConv>) -> Self {
+        KcpCore(Arc::new(Mutex::new(CoreImpl {
+            kcp,
+            send_waker: Default::default(),
+            recv_waker: Default::default(),
+            close_waker: Default::default(),
+        })))
+    }
+
+    fn close(&self) {}
+
     async fn input(&self, data: &[u8]) -> kcp::Result<()> {
-        self.0.lock().unwrap().kcp.input(data);
+        // self.0.lock().unwrap().kcp.input(data);
         Ok(())
+    }
+
+    fn poll_read(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut [u8],
+    ) -> Poll<std::io::Result<usize>> {
+        let core = self.0.lock().unwrap();
+        Poll::Pending
+    }
+
+    fn poll_write(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        let mut this = self.0.lock().unwrap();
+
+        if this.kcp.waitsnd() > 0 {
+            this.send_waker = Some(cx.waker().clone());
+            Poll::Pending
+        } else {
+            Poll::Ready(Ok(this.kcp.send(buf).unwrap()))
+        }
+    }
+}
+
+impl CoreImpl {
+    fn try_wake_send(&mut self) {
+        if let Some(waker) = self.send_waker.take() {
+            waker.wake();
+        }
+    }
+
+    fn try_wake_recv(&mut self) {
+        if let Some(waker) = self.recv_waker.take() {
+            waker.wake();
+        }
+    }
+
+    fn try_wake_close(&mut self) {
+        if let Some(waker) = self.close_waker.take() {
+            waker.wake();
+        }
     }
 }
 
@@ -252,14 +359,7 @@ impl Future for Processor {
         mut self: Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Self::Output> {
-        loop {
-            match Pin::new(&mut self.0).poll(cx) {
-                Poll::Ready(_) => {}
-                Poll::Pending => break std::task::Poll::Pending,
-                Poll::Ready(Err(e)) => {
-                    break Poll::Ready(Ok(()));
-                }
-            }
-        }
+        log::debug!("start kcp processor at {:?}", std::thread::current().id());
+        Pin::new(&mut self.0).poll(cx)
     }
 }

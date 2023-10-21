@@ -9,6 +9,7 @@ pub type Result<T> = std::result::Result<T, KcpError>;
 #[derive(Debug)]
 pub enum KcpError {
     Core(KcpErrorKind),
+    WriteTimeout(u32),
     SignalReadClosed,
     SignalSendClosed
 }

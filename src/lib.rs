@@ -57,6 +57,7 @@ where
 mod tests {
     use std::pin::Pin;
     use std::sync::Arc;
+    use std::time::Duration;
 
     use smol::future::FutureExt;
     use smol::io;
@@ -70,6 +71,7 @@ mod tests {
     pub struct UdpSocket {
         inner: smol::net::UdpSocket,
         reader_fut: Arc<std::sync::Mutex<Option<poller::BoxedFuture<io::Result<Vec<u8>>>>>>,
+        writer_fut: Arc<std::sync::Mutex<Option<poller::BoxedFuture<io::Result<usize>>>>>,
     }
 
     impl UdpSocket {
@@ -77,6 +79,7 @@ mod tests {
             Self {
                 inner: udp,
                 reader_fut: Default::default(),
+                writer_fut: Default::default(),
             }
         }
     }
@@ -88,7 +91,29 @@ mod tests {
             buf: &[u8],
         ) -> std::task::Poll<std::io::Result<usize>> {
             // let a = self.send(buf);
-            unimplemented!()
+            log::debug!("send {:?}", String::from_utf8_lossy(buf));
+
+            let mut this = self.writer_fut.lock().unwrap();
+
+            let mut fut = this.take().unwrap_or_else(|| {
+                let udp = self.inner.clone();
+                let mut buf = buf.to_vec();
+                Box::pin(async move {
+                    let n = udp.send(&mut buf).await?;
+                    std::io::Result::Ok(n)
+                })
+            });
+
+            log::debug!("polling udp_send socket from smol");
+
+            match Pin::new(&mut fut).poll(cx) {
+                std::task::Poll::Ready(Err(e)) => std::task::Poll::Ready(Err(e)),
+                std::task::Poll::Pending => {
+                    *this = Some(fut);
+                    std::task::Poll::Pending
+                }
+                std::task::Poll::Ready(Ok(n)) => std::task::Poll::Ready(Ok(n)),
+            }
         }
     }
 
@@ -110,11 +135,12 @@ mod tests {
                 Box::pin(async move {
                     let n = udp.recv(&mut buf).await?;
                     buf.truncate(n);
+                
                     std::io::Result::Ok(buf)
                 })
             });
 
-            log::debug!("polling udp socket from smol");
+            log::debug!("polling udp_recv socket from smol");
 
             match Pin::new(&mut fut).poll(cx) {
                 std::task::Poll::Ready(Err(e)) => std::task::Poll::Ready(Err(e)),
@@ -124,6 +150,7 @@ mod tests {
                 }
                 std::task::Poll::Ready(Ok(data)) => {
                     buf[..data.len()].copy_from_slice(&data);
+                    log::debug!("receive from data {}", data.len());
                     std::task::Poll::Ready(Ok(data.len()))
                 }
             }
@@ -149,6 +176,7 @@ mod tests {
     impl poller::Timer for KcpTimer {
         fn sleep(&self, time: std::time::Duration) -> poller::BoxedFuture<()> {
             Box::pin(async move {
+                // log::debug!("sleep {:?}", time);
                 smol::Timer::after(time).await;
             })
         }
@@ -162,10 +190,11 @@ mod tests {
                 .spawn(move || {
                     smol::block_on(async move {
                         process.await.unwrap();
+                        log::debug!("processor exit ..")
                     })
                 })
                 .unwrap();
-
+            
             Ok(())
         }
     }
@@ -193,17 +222,25 @@ mod tests {
 
             let udp = smol::net::UdpSocket::bind("0.0.0.0:0").await?;
 
-            udp.connect("127.0.0.1:9999").await?;
+            udp.connect("8.8.8.8:53").await?;
 
             let mut kcp_connector = KcpConnector::new::<KcpClientRuntime>(UdpSocket::new(udp))?;
 
-            let mut kcp = kcp_connector.open()?;
+            let mut kcp = kcp_connector.open().await?;
 
             let mut buf = [0u8; 21];
 
-            let a = kcp.write(&mut buf).await.unwrap();
+            let a = kcp.write(b"hello world").await.unwrap();
 
-            let a = kcp.read(&mut buf).await.unwrap();
+            log::debug!("send okay ...");
+
+            // let a = kcp.read(&mut buf).await.unwrap();
+
+            // kcp_connector.close().await;
+
+            drop(kcp);
+
+            smol::Timer::after(Duration::from_secs(60)).await;
 
             Ok(())
         })

@@ -34,13 +34,18 @@ pub trait AsyncWrite {
 pub trait AsyncSendTo {
     fn poll_sendto(
         &mut self,
+        cx: &mut Context<'_>,
         addr: &SocketAddr,
-        buf: Vec<u8>,
+        buf: &[u8],
     ) -> std::task::Poll<std::io::Result<usize>>;
 }
 
 pub trait AsyncRecvfrom {
-    fn poll_recvfrom(&mut self) -> std::task::Poll<std::io::Result<(SocketAddr, Vec<u8>)>>;
+    fn poll_recvfrom(
+        &mut self,
+        cx: &mut Context<'_>,
+        buf: &mut [u8],
+    ) -> std::task::Poll<std::io::Result<(SocketAddr, usize)>>;
 }
 
 pub trait AsyncSend {
@@ -130,7 +135,7 @@ where
 impl<F, O> Future for PollFn<F>
 where
     O: Unpin,
-    F: FnMut(&mut Context<'_>) -> Poll<O> + Unpin
+    F: FnMut(&mut Context<'_>) -> Poll<O> + Unpin,
 {
     type Output = O;
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> std::task::Poll<Self::Output> {

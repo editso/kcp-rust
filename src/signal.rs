@@ -137,6 +137,7 @@ impl<T: Unpin> SigWrite<T> {
     }
 }
 
+
 impl<T: Unpin> SigRead<T> {
     pub fn close(&self) {
         let mut this = self.0.lock().unwrap();
@@ -159,7 +160,6 @@ impl<T: Unpin> SigRead<T> {
                     }
                     Poll::Ready(Err(e)) => Poll::Ready(Err(e.into())),
                 }
-                // Poll::Pending
             }
         })
         .await

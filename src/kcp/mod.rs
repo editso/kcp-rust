@@ -50,6 +50,7 @@ where
         };
 
         let ikcp = unsafe { ikcp::create(conv, user_data) };
+
         if ikcp.is_null() {
             Err(KcpErrorKind::CreateFail.into())
         } else {
@@ -60,6 +61,10 @@ where
                 allocator,
             })
         }
+    }
+
+    pub fn conv(&self) -> u32 {
+        self.conv
     }
 
     pub fn get_conv(pkt: &[u8]) -> u32 {
@@ -92,7 +97,12 @@ where
     {
         let data = pkt.as_ref();
         let retval = unsafe { ikcp::input(self.ikcp, data.as_ptr(), data.len()) };
-        Ok(())
+
+        if retval < 0 {
+            Err(KcpErrorKind::InputError(retval).into())
+        } else {
+            Ok(())
+        }
     }
 
     pub fn update(&self, current: u32) {
@@ -103,8 +113,12 @@ where
         unsafe { ikcp::check(self.ikcp, current) }
     }
 
+    pub fn peeksize(&self) -> i32 {
+        unsafe { ikcp::peeksize(self.ikcp) }
+    }
+
     pub fn waitsnd(&self) -> u32 {
-        unsafe { ikcp::waitsnd(self.ikcp) as u32}
+        unsafe { ikcp::waitsnd(self.ikcp) as u32 }
     }
 
     pub fn set_output(&self, output: ikcp::OutputFn) {

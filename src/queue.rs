@@ -74,7 +74,7 @@ where
             Ok(())
         }
     }
-
+                                                                              
     pub fn close(&self) {
         self.0.lock().unwrap().close();
     }

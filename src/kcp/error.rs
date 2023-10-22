@@ -1,4 +1,4 @@
-use std::{sync::{MutexGuard, PoisonError}, convert::Infallible};
+use std::{sync::{MutexGuard, PoisonError}, convert::Infallible, io};
 
 use crate::signal;
 
@@ -17,6 +17,7 @@ pub enum KcpError {
 #[derive(Debug)]
 pub enum KcpErrorKind {
     CreateFail,
+    InputError(i32),
     InvalidConv(u32),
     UserDataToSmall(u32),
     InvalidCommand(u32, u8),
@@ -41,5 +42,16 @@ where
 impl From<std::io::Error> for KcpError {
     fn from(e: std::io::Error) -> Self {
         Self::Core(KcpErrorKind::StdIoError(e))
+    }
+}
+
+impl From<KcpError> for io::Error{
+    fn from(kcp_err: KcpError) -> Self {
+        match kcp_err {
+            KcpError::Core(coew) => todo!(),
+            KcpError::WriteTimeout(_) => todo!(),
+            KcpError::SignalReadClosed => todo!(),
+            KcpError::SignalSendClosed => todo!(),
+        }
     }
 }

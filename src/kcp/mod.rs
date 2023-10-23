@@ -204,8 +204,6 @@ where
     A: ConvAllocator,
 {
     fn drop(&mut self) {
-        self.allocator.deallocate(self.conv);
-
         unsafe {
             ikcp::release(self.ikcp);
         }
@@ -214,5 +212,7 @@ where
             let drop = user.drop;
             drop(user.user);
         }
+
+        self.allocator.deallocate(self.conv);
     }
 }

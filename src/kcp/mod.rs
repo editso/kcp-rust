@@ -12,11 +12,43 @@ pub struct User {
     drop: fn(*mut std::ffi::c_void),
 }
 
+#[derive(Clone, Debug, Copy)]
+pub struct KcpConfig {
+    nc: bool,
+    timeout: u32,
+    nodelay: bool,
+    interval: i32,
+    resend: i32,
+    window_size: i32,
+    close_delay: u32,
+}
+
+pub const FAST_MODE: KcpConfig = KcpConfig {
+    nc: true,
+    timeout: 15000,
+    nodelay: true,
+    interval: 10,
+    resend: 2,
+    window_size: 2048,
+    close_delay: 10000,
+};
+
+pub const NORMAL_MODE: KcpConfig = KcpConfig {
+    nc: false,
+    timeout: 15000,
+    nodelay: false,
+    interval: 40,
+    resend: 0,
+    window_size: 512,
+    close_delay: 15000,
+};
+
 #[derive(Debug)]
 pub struct Kcp<A: ConvAllocator> {
     conv: ikcp::CONV_T,
     ikcp: ikcp::CB,
     user: Option<User>,
+    config: KcpConfig,
     allocator: A,
 }
 
@@ -34,6 +66,7 @@ where
 {
     pub fn new<U>(
         mut allocator: A,
+        config: KcpConfig,
         user: Option<(*mut U, fn(*mut std::ffi::c_void))>,
     ) -> error::Result<Self> {
         let conv = allocator.allocate()?;
@@ -52,15 +85,42 @@ where
         let ikcp = unsafe { ikcp::create(conv, user_data) };
 
         if ikcp.is_null() {
-            Err(KcpErrorKind::CreateFail.into())
-        } else {
-            Ok(Self {
-                conv,
-                ikcp,
-                user,
-                allocator,
-            })
+            return Err(KcpErrorKind::CreateFail.into());
         }
+
+        unsafe {
+            ikcp::wndsize(ikcp, config.window_size, config.window_size);
+
+            ikcp::nodelay(
+                ikcp,
+                config.nodelay,
+                config.interval,
+                config.resend,
+                config.nc,
+            );
+        }
+
+        Ok(Self {
+            conv,
+            ikcp,
+            user,
+            config,
+            allocator,
+        })
+    }
+
+    pub fn new_fast<U>(
+        allocator: A,
+        user: Option<(*mut U, fn(*mut std::ffi::c_void))>,
+    ) -> error::Result<Self> {
+        Self::new(allocator, FAST_MODE, user)
+    }
+
+    pub fn new_normal<U>(
+        allocator: A,
+        user: Option<(*mut U, fn(*mut std::ffi::c_void))>,
+    ) -> error::Result<Self> {
+        Self::new(allocator, NORMAL_MODE, user)
     }
 
     pub fn conv(&self) -> u32 {
@@ -96,6 +156,7 @@ where
         D: AsRef<[u8]>,
     {
         let data = pkt.as_ref();
+
         let retval = unsafe { ikcp::input(self.ikcp, data.as_ptr(), data.len()) };
 
         if retval < 0 {
@@ -123,6 +184,18 @@ where
 
     pub fn set_output(&self, output: ikcp::OutputFn) {
         unsafe { ikcp::setoutput(self.ikcp, output) }
+    }
+
+    pub fn wndsize(&self) -> i32 {
+        self.config.window_size
+    }
+
+    pub fn close_delay(&self) -> u32 {
+        self.config.close_delay
+    }
+
+    pub fn timeout(&self) -> u32 {
+        self.config.timeout
     }
 }
 

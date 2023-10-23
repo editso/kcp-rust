@@ -1,11 +1,10 @@
-                                                                                                                                                                                                                                           mod r#async;
+mod r#async;
 mod client;
 mod kcp;
 mod poller;
 mod queue;
 mod server;
 mod signal;
-
 
 use std::{future::Future, pin::Pin};
 
@@ -67,19 +66,20 @@ where
     }
 
     fn poll_flush(
-        self: Pin<&mut Self>,
+        mut self: Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
-        unimplemented!()
+        Pin::new(&mut self.0).poll_flush(cx)
     }
 
     fn poll_close(
-        self: Pin<&mut Self>,
+        mut self: Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
-        unimplemented!()
+        Pin::new(&mut self.0).poll_close(cx)
     }
 }
+
 
 #[cfg(test)]
 mod tests {
@@ -94,7 +94,7 @@ mod tests {
     use crate::r#async::{
         AsyncReadExt, AsyncRecv, AsyncRecvfrom, AsyncSend, AsyncSendTo, AsyncWriteExt,
     };
-    use crate::{client, kcp, poller, Processor};
+    use crate::{client, kcp, poller, KcpStream, Processor};
     use crate::{client::KcpConnector, server::KcpListener};
 
     #[derive(Clone)]
@@ -167,7 +167,6 @@ mod tests {
                 Box::pin(async move {
                     let n = udp.recv(&mut buf).await?;
                     buf.truncate(n);
-
                     std::io::Result::Ok(buf)
                 })
             });
@@ -230,7 +229,7 @@ mod tests {
                 let udp = self.inner.clone();
                 let mut buf = unsafe {
                     let mut tmp = Vec::with_capacity(buf.len());
-                    tmp.resize(buf.len(), 0);
+                    tmp.set_len(buf.len());
                     tmp
                 };
                 Box::pin(async move {
@@ -270,6 +269,7 @@ mod tests {
             })
         }
     }
+
     impl crate::Runner for KcpRunner {
         type Err = io::Error;
         fn call(process: Processor) -> std::result::Result<(), Self::Err> {
@@ -287,6 +287,77 @@ mod tests {
                 .unwrap();
 
             Ok(())
+        }
+    }
+
+    impl smol::io::AsyncRead for KcpStream<crate::client::ClientImpl> {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &mut [u8],
+        ) -> std::task::Poll<io::Result<usize>> {
+            match crate::AsyncRead::poll_read(self, cx, buf)? {
+                std::task::Poll::Pending => std::task::Poll::Pending,
+                std::task::Poll::Ready(n) => std::task::Poll::Ready(Ok(n)),
+            }
+        }
+    }
+
+    impl smol::io::AsyncWrite for KcpStream<crate::client::ClientImpl> {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<io::Result<usize>> {
+            crate::AsyncWrite::poll_write(self, cx, buf)
+        }
+
+        fn poll_close(
+            self: Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            crate::AsyncWrite::poll_close(self, cx)
+        }
+
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            crate::AsyncWrite::poll_flush(self, cx)
+        }
+    }
+
+    impl smol::io::AsyncRead for KcpStream<crate::server::ServerImpl> {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &mut [u8],
+        ) -> std::task::Poll<io::Result<usize>> {
+            crate::AsyncRead::poll_read(self, cx, buf)
+        }
+    }
+
+    impl smol::io::AsyncWrite for KcpStream<crate::server::ServerImpl> {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<io::Result<usize>> {
+            crate::AsyncWrite::poll_write(self, cx, buf)
+        }
+
+        fn poll_close(
+            self: Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            crate::AsyncWrite::poll_close(self, cx)
+        }
+
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            crate::AsyncWrite::poll_flush(self, cx)
         }
     }
 
@@ -309,41 +380,31 @@ mod tests {
                 .filter_module("kcp_rust", log::LevelFilter::Trace)
                 .init();
 
-            log::debug!("start kcp client");
-
             let udp = smol::net::UdpSocket::bind("0.0.0.0:0").await?;
 
             udp.connect("127.0.0.1:9999").await?;
 
+            let tcp_server = smol::net::TcpListener::bind("0.0.0.0:7777").await.unwrap();
             let mut kcp_connector = KcpConnector::new::<KcpClientRuntime>(UdpSocket::new(udp))?;
 
-            let mut kcp = kcp_connector.open().await?;
-
-            let mut buf = [0u8; 21];
-
-            let a = kcp.write(b"hello world").await.unwrap();
-
-            // let a = kcp.write(b"hello world").await.unwrap();
-
-            log::debug!("send okay ...");
-
             loop {
-                match kcp.read(&mut buf).await {
-                    Ok(n) => {
-                        log::info!("message: {:?}", String::from_utf8_lossy(&buf[..n]));
-                        if let Err(e) = kcp.write(&buf[..n]).await {
-                            log::error!("{:?}", e);
-                            break;
-                        }
-                    }
-                    Err(e) => {
-                        log::error!("{:?}", e);
-                        break;
-                    }
-                }
-            }
+                let (stream, _) = tcp_server.accept().await.unwrap();
+                let kcp = kcp_connector.open().await.unwrap();
 
-            log::debug!("exit test");
+                smol::spawn(async move {
+                    let (tcp_reader, tcp_writer) = smol::io::split(stream);
+                    let (kcp_reader, kcp_writer) = smol::io::split(kcp);
+                    if let Err(e) = smol::future::race(
+                        smol::io::copy(tcp_reader, kcp_writer),
+                        smol::io::copy(kcp_reader, tcp_writer),
+                    )
+                    .await
+                    {
+                        log::error!("{:?}", e);
+                    };
+                })
+                .detach();
+            }
 
             Ok(())
         })
@@ -362,29 +423,22 @@ mod tests {
             let kcp_server = KcpListener::new::<KcpClientRuntime>(udp).unwrap();
 
             loop {
-                let mut stream = kcp_server.accept().await.unwrap();
-                let mut buf = Vec::new();
-                buf.resize(1500, 0);
+                let stream = kcp_server.accept().await.unwrap();
+                let kcp = smol::net::TcpStream::connect("127.0.0.1:8888")
+                    .await
+                    .unwrap();
 
                 smol::spawn(async move {
-                    loop {
-                        match stream.read(&mut buf).await {
-                            Ok(n) => {
-                                log::info!("message: {:?}", String::from_utf8_lossy(&buf[..n]));
-
-                                if let Err(e) = stream.write(&buf[..n]).await {
-                                    log::error!("{:?}", e);
-                                    break;
-                                }
-                            }
-                            Err(e) => {
-                                log::error!("{:?}", e);
-                                break;
-                            }
-                        };
-
-                        // break;
-                    }
+                    let (tcp_reader, tcp_writer) = smol::io::split(stream);
+                    let (kcp_reader, kcp_writer) = smol::io::split(kcp);
+                    if let Err(e) = smol::future::race(
+                        smol::io::copy(tcp_reader, kcp_writer),
+                        smol::io::copy(kcp_reader, tcp_writer),
+                    )
+                    .await
+                    {
+                        log::error!("{:?}", e);
+                    };
                 })
                 .detach();
             }

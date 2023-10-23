@@ -36,6 +36,11 @@ pub enum KcpUpdateSig {
     Resume,
 }
 
+pub enum KcpCloseSig {
+    Quit,
+    Close(u32),
+}
+
 pub struct SigRead<T: Unpin>(Arc<Mutex<SignalImpl<T>>>);
 
 pub struct SigWrite<T: Unpin>(Arc<Mutex<SignalImpl<T>>>);
@@ -137,7 +142,6 @@ impl<T: Unpin> SigWrite<T> {
     }
 }
 
-
 impl<T: Unpin> SigRead<T> {
     pub fn close(&self) {
         let mut this = self.0.lock().unwrap();
@@ -165,7 +169,6 @@ impl<T: Unpin> SigRead<T> {
         .await
     }
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -260,7 +263,6 @@ mod tests {
                 let f = poll_fn(|cx| Pin::new(&mut a).poll(cx));
 
                 let r = poll_signal_or(f, s.1.recv()).await;
-                
             }
         })
     }

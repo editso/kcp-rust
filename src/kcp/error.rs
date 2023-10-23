@@ -1,6 +1,7 @@
-use std::{sync::{MutexGuard, PoisonError}, convert::Infallible, io};
-
-use crate::signal;
+use std::{
+    io,
+    sync::{MutexGuard, PoisonError},
+};
 
 use super::{ConvAllocator, Kcp};
 
@@ -9,9 +10,11 @@ pub type Result<T> = std::result::Result<T, KcpError>;
 #[derive(Debug)]
 pub enum KcpError {
     Core(KcpErrorKind),
+    ReadTimeout(u32),
     WriteTimeout(u32),
+    Closed,
     SignalReadClosed,
-    SignalSendClosed
+    SignalSendClosed,
 }
 
 #[derive(Debug)]
@@ -45,13 +48,15 @@ impl From<std::io::Error> for KcpError {
     }
 }
 
-impl From<KcpError> for io::Error{
+impl From<KcpError> for io::Error {
     fn from(kcp_err: KcpError) -> Self {
         match kcp_err {
             KcpError::Core(coew) => todo!(),
             KcpError::WriteTimeout(_) => todo!(),
             KcpError::SignalReadClosed => todo!(),
             KcpError::SignalSendClosed => todo!(),
+            KcpError::Closed => todo!(),
+            KcpError::ReadTimeout(_) => todo!(),
         }
     }
 }

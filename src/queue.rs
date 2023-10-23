@@ -7,8 +7,6 @@ use std::{
     task::{Poll, Waker},
 };
 
-use crate::kcp;
-
 pub struct QueueImpl<T: Unpin> {
     max: usize,
     queue: VecDeque<T>,
@@ -74,7 +72,7 @@ where
             Ok(())
         }
     }
-                                                                              
+
     pub fn close(&self) {
         self.0.lock().unwrap().close();
     }

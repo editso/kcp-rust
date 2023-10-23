@@ -53,7 +53,7 @@ pub mod ikcp {
         pub(crate) fn waitsnd(kcp: CB) -> i32;
 
         #[link_name = "ikcp_nodelay"]
-        pub(crate) fn nodelay(kcp: CB, nodelay: i32, interval: i32, resend: i32, nc: i32) -> i32;
+        pub(crate) fn nodelay(kcp: CB, nodelay: bool, interval: i32, resend: i32, nc: bool) -> i32;
 
         #[link_name = "ikcp_getconv"]
         pub(crate) fn getconv(ptr: *const c_void) -> CONV_T;

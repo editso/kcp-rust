@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::ffi::c_void;
 
+use std::future::Future;
 use std::io;
 use std::ops::Add;
 use std::pin::Pin;
@@ -24,6 +25,7 @@ struct KcpConv {
 struct ManagerImpl {
     snd_que: WriteHalf<Vec<u8>>,
     poller: poller::KcpPoller<KcpConv>,
+    kcp_closer: WriteHalf<u32>,
     kcp_read_sig: Arc<SigWrite<KcpReadSig>>,
     kcp_update_sig: SigWrite<KcpUpdateSig>,
     sessions: HashMap<u32, KcpCore>,
@@ -62,12 +64,14 @@ where
 
         let kcp_read_signal = signal::signal(10);
         let kcp_update_signal = signal::signal(10);
+        let kcp_closer = Queue::new(255).split();
 
         let kcp_read_sig_0 = Arc::new(kcp_read_signal.0);
 
         let manager = KcpManager(Arc::new(Mutex::new(ManagerImpl {
             poller: poller.clone(),
             snd_que: snd_que.0,
+            kcp_closer: kcp_closer.0,
             kcp_read_sig: kcp_read_sig_0.clone(),
             kcp_update_sig: kcp_update_signal.0,
             sessions: Default::default(),
@@ -87,6 +91,10 @@ where
                 kcp_read_sig_0,
                 snd_que.1,
                 io.clone(),
+            ))),
+            Processor(Box::pin(Self::run_async_close(
+                kcp_closer.1,
+                manager.clone(),
             ))),
         ];
 
@@ -118,7 +126,7 @@ where
             }
         }
 
-        let kcp = kcp::Kcp::new::<KcpManager>(
+        let kcp = kcp::Kcp::new_fast::<KcpManager>(
             self.allocate.clone(),
             Some((
                 Box::into_raw(Box::new(self.manager.clone())),
@@ -162,6 +170,48 @@ impl<IO> KcpConnector<IO>
 where
     IO: AsyncSend + Clone + Unpin,
 {
+    async fn run_async_close(
+        close_receiver: ReadHalf<u32>,
+        manager: KcpManager,
+    ) -> kcp::Result<()> {
+        let mut futures = Vec::new();
+
+        loop {
+            let mut recv_close_fut = close_receiver.recv();
+            let (clean_now, conv) = poll_fn(|cx| match Pin::new(&mut recv_close_fut).poll(cx)? {
+                std::task::Poll::Ready(conv) => match manager.lookup(conv) {
+                    None => Poll::Ready(kcp::Result::Ok((false, conv))),
+                    Some(kcp) => {
+                        futures.push(poll_fn(move |cx| match kcp.0.poll_close(cx) {
+                            std::task::Poll::Pending => std::task::Poll::Pending,
+                            std::task::Poll::Ready(_) => std::task::Poll::Ready(conv),
+                        }));
+                        Poll::Ready(Ok((false, conv)))
+                    }
+                },
+                std::task::Poll::Pending => {
+                    let mut poll = Poll::Pending;
+
+                    futures.retain_mut(|future| match Pin::new(future).poll(cx) {
+                        Poll::Pending => true,
+                        Poll::Ready(conv) => {
+                            poll = Poll::Ready(Ok((true, conv)));
+                            false
+                        }
+                    });
+
+                    poll
+                }
+            })
+            .await?;
+
+            if clean_now {
+                log::trace!("clean kcp session: conv={}", conv);
+                manager.remove(conv);
+            }
+        }
+    }
+
     async fn run_async_write(
         sig: Arc<SigWrite<KcpReadSig>>,
         snd_que: ReadHalf<Vec<u8>>,
@@ -217,7 +267,6 @@ where
                         pause_read = true;
                     }
                     KcpReadSig::Resume => {
-                        log::trace!("resume kcp_read");
                         pause_read = false;
                     }
                 },
@@ -238,7 +287,7 @@ where
                         }
                         Some(core) => {
                             if let Err(e) = core.input(&buf[..n]).await {
-                                println!("{:?}", e);
+                                log::trace!("error {:?}", e);
                             }
                         }
                     }
@@ -360,6 +409,12 @@ impl KcpManager {
         log::trace!("{} sessions were forcibly closed", count)
     }
 
+    fn close_kcp(&self, conv: u32) {
+        if let Err(e) = self.0.lock().unwrap().kcp_closer.block_send(conv) {
+            log::error!("{:?}", e);
+        };
+    }
+
     fn stop_all_processor(&self) {
         let this = self.0.lock().unwrap();
         this.kcp_read_sig.close();
@@ -395,8 +450,6 @@ impl KcpCore {
 
 impl Drop for ClientImpl {
     fn drop(&mut self) {
-        log::trace!("clean session in KcpManager: conv = {}", self.conv);
-
-        self.manager.remove(self.conv);
+        self.manager.close_kcp(self.conv);
     }
 }

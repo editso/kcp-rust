@@ -170,7 +170,7 @@ impl<A: ConvAllocator> SafeKcp<A> {
                     drop(this);
                     waker.wake();
                 }
-                return Err(kcp::KcpError::WriteTimeout(diff));
+                return Err(kcp::KcpError::ReadTimeout(diff));
             }
 
             if this.send_waker.is_some() && diff > this.send_timeout {

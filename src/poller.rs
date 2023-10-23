@@ -217,9 +217,7 @@ impl<A: ConvAllocator> SafeKcp<A> {
             }
         };
 
-        self.try_wake_recv();
-        self.try_wake_send();
-        self.try_wake_flush();
+        self.try_wake_all();
 
         Poll::Ready(retval)
     }

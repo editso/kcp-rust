@@ -80,15 +80,15 @@ where
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use std::net::SocketAddr;
     use std::pin::Pin;
     use std::sync::Arc;
+    use std::thread;
     use std::time::Duration;
 
-    use smol::future::FutureExt;
+    use smol::future::{self, FutureExt};
     use smol::io;
 
     use crate::r#async::{
@@ -375,6 +375,15 @@ mod tests {
 
     #[test]
     fn test_kcp_client() -> kcp::Result<()> {
+        let executor = Arc::new(smol::Executor::<'_>::new());
+
+        for i in 1..10 {
+            let executor = executor.clone();
+            thread::spawn(move || loop {
+                smol::block_on(executor.run(smol::future::pending()))
+            });
+        }
+
         smol::block_on(async move {
             env_logger::builder()
                 .filter_module("kcp_rust", log::LevelFilter::Trace)
@@ -391,19 +400,21 @@ mod tests {
                 let (stream, _) = tcp_server.accept().await.unwrap();
                 let kcp = kcp_connector.open().await.unwrap();
 
-                smol::spawn(async move {
-                    let (tcp_reader, tcp_writer) = smol::io::split(stream);
-                    let (kcp_reader, kcp_writer) = smol::io::split(kcp);
-                    if let Err(e) = smol::future::race(
-                        smol::io::copy(tcp_reader, kcp_writer),
-                        smol::io::copy(kcp_reader, tcp_writer),
-                    )
-                    .await
-                    {
-                        log::error!("{:?}", e);
-                    };
-                })
-                .detach();
+                executor
+                    .spawn(async move {
+                        log::debug!("thread {:?}", thread::current().id());
+                        let (tcp_reader, tcp_writer) = smol::io::split(stream);
+                        let (kcp_reader, kcp_writer) = smol::io::split(kcp);
+                        if let Err(e) = smol::future::race(
+                            smol::io::copy(tcp_reader, kcp_writer),
+                            smol::io::copy(kcp_reader, tcp_writer),
+                        )
+                        .await
+                        {
+                            log::error!("{:?}", e);
+                        };
+                    })
+                    .detach();
             }
 
             Ok(())
@@ -415,6 +426,15 @@ mod tests {
         env_logger::builder()
             .filter_module("kcp_rust", log::LevelFilter::Trace)
             .init();
+
+        let executor = Arc::new(smol::Executor::<'_>::new());
+
+        for i in 1..10 {
+            let executor = executor.clone();
+            thread::spawn(move || loop {
+                smol::block_on(executor.run(smol::future::pending()))
+            });
+        }
 
         smol::block_on(async {
             let udp = smol::net::UdpSocket::bind("127.0.0.1:9999").await.unwrap();
@@ -428,19 +448,21 @@ mod tests {
                     .await
                     .unwrap();
 
-                smol::spawn(async move {
-                    let (tcp_reader, tcp_writer) = smol::io::split(stream);
-                    let (kcp_reader, kcp_writer) = smol::io::split(kcp);
-                    if let Err(e) = smol::future::race(
-                        smol::io::copy(tcp_reader, kcp_writer),
-                        smol::io::copy(kcp_reader, tcp_writer),
-                    )
-                    .await
-                    {
-                        log::error!("{:?}", e);
-                    };
-                })
-                .detach();
+                executor
+                    .spawn(async move {
+                        log::debug!("thread {:?}", thread::current().id());
+                        let (tcp_reader, tcp_writer) = smol::io::split(stream);
+                        let (kcp_reader, kcp_writer) = smol::io::split(kcp);
+                        if let Err(e) = smol::future::race(
+                            smol::io::copy(tcp_reader, kcp_writer),
+                            smol::io::copy(kcp_reader, tcp_writer),
+                        )
+                        .await
+                        {
+                            log::error!("{:?}", e);
+                        };
+                    })
+                    .detach();
             }
         })
     }

@@ -44,11 +44,11 @@ where
         })))
     }
 
-    pub fn recv<'a>(&'a self) -> QueueRead<'a, T> {
+    pub fn recv(&self) -> QueueRead<'_, T> {
         QueueRead { queue: &self.0 }
     }
 
-    pub fn send<'a>(&'a self, data: T) -> QueueSend<'a, T> {
+    pub fn send(&self, data: T) -> QueueSend<'_, T> {
         QueueSend {
             data: Some(data),
             queue: &self.0,
@@ -64,7 +64,7 @@ where
 
         if this.closed {
             this.wake_send();
-            return Err(io::ErrorKind::Interrupted.into());
+            Err(io::ErrorKind::Interrupted.into())
         } else {
             this.push_back(t);
             this.wake_recv();
@@ -242,14 +242,12 @@ impl<T: Unpin> std::ops::DerefMut for WriteHalf<T> {
 
 impl<T: Unpin> Drop for ReadHalf<T> {
     fn drop(&mut self) {
-        log::debug!("close read");
         self.close();
     }
 }
 
 impl<T: Unpin> Drop for WriteHalf<T> {
     fn drop(&mut self) {
-        log::debug!("close write");
         self.close();
     }
 }

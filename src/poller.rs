@@ -1,4 +1,5 @@
 use std::{
+    any::Any,
     future::Future,
     io,
     ops::Sub,
@@ -10,6 +11,7 @@ use std::{
 
 use crate::{
     kcp::{self, ConvAllocator, Kcp},
+    queue::{Queue, ReadHalf, WriteHalf},
     r#async::poll_fn,
     signal::{poll_signal_or, KcpUpdateSig, Sig, SigRead},
 };
@@ -35,17 +37,12 @@ pub struct KcpImpl<A: ConvAllocator> {
 pub struct SafeKcp<A: ConvAllocator>(Arc<Mutex<KcpImpl<A>>>);
 
 pub trait Timer {
-    fn sleep(&self, time: std::time::Duration) -> BoxedFuture<()>;
+    type Ret: Any;
+    type Output: Future<Output = Self::Ret> + Send + Unpin + 'static;
+    fn sleep(&self, time: std::time::Duration) -> Self::Output;
 }
 
-pub struct PollerImpl<A: ConvAllocator> {
-    timer: Box<dyn Timer + Send + 'static>,
-    waker: Option<Waker>,
-    session: Vec<SafeKcp<A>>,
-    sleep_fut: Option<BoxedFuture<()>>,
-}
-
-pub struct KcpPoller<A: ConvAllocator>(Arc<Mutex<PollerImpl<A>>>);
+pub struct KcpPoller<A: ConvAllocator>(Arc<WriteHalf<SafeKcp<A>>>);
 
 pub fn now_mills() -> u32 {
     std::time::SystemTime::now()
@@ -300,37 +297,74 @@ impl<A: ConvAllocator> SafeKcp<A> {
     }
 }
 
-impl<A: ConvAllocator> KcpPoller<A> {
-    pub fn new<T>(timer: T) -> Self
+impl<A: ConvAllocator> KcpPoller<A>
+where
+    A: Send + 'static,
+{
+    pub fn new<T>(timer: T) -> (Self, BoxedFuture<kcp::Result<()>>)
     where
-        T: Timer + Send + 'static,
+        T: Timer + Send + Sync + 'static,
     {
-        KcpPoller(Arc::new(Mutex::new(PollerImpl {
-            waker: None,
-            timer: Box::new(timer),
-            session: Default::default(),
-            sleep_fut: None,
-        })))
+        let (rx, ax) = Queue::new(10).split();
+        let poller = KcpPoller(Arc::new(rx));
+        (poller, Box::pin(self::poller_main(timer, ax)))
     }
 
-    pub fn wake(&self) {
-        if let Some(waker) = self.0.lock().unwrap().waker.take() {
-            waker.wake();
-        }
+    pub fn stop(&self) {
+        self.0.close();
     }
 
-    pub fn register(&self, kcp: SafeKcp<A>) {
-        self.0.lock().unwrap().session.push(kcp);
-        self.wake();
+    pub async fn register(&self, kcp: SafeKcp<A>) -> io::Result<()> {
+        self.0.send(kcp).await
     }
 }
 
-pub async fn run_async_update<A: ConvAllocator>(
+async fn poller_main<A, T>(timer: T, ax: ReadHalf<SafeKcp<A>>) -> kcp::Result<()>
+where
+    A: ConvAllocator,
+    T: Timer + Send + 'static,
+{
+    let mut sessions: Vec<SafeKcp<A>> = Vec::new();
+    let mut sleep_fut: Option<T::Output> = None;
+
+    loop {
+        let mut recv_fut = ax.recv();
+
+        poll_fn(|cx| match Pin::new(&mut recv_fut).poll(cx)? {
+            Poll::Ready(kcp) => {
+                sessions.push(kcp);
+                Poll::Ready(kcp::Result::Ok(()))
+            }
+            Poll::Pending => match sleep_fut.take() {
+                None => {
+                    if sessions.is_empty() {
+                        Poll::Pending
+                    } else {
+                        let nex_chk = self::poll_update(cx, &mut sessions);
+                        sleep_fut = Some(timer.sleep(nex_chk));
+                        Poll::Ready(Ok(()))
+                    }
+                }
+                Some(mut fut) => match Pin::new(&mut fut).poll(cx) {
+                    Poll::Ready(_) => Poll::Ready(Ok(())),
+                    Poll::Pending => {
+                        sleep_fut = Some(fut);
+                        Poll::Pending
+                    }
+                },
+            },
+        })
+        .await?;
+    }
+}
+
+pub async fn run_async_update(
     signal: SigRead<KcpUpdateSig>,
-    mut poller: KcpPoller<A>,
+    poller_fut: BoxedFuture<kcp::Result<()>>,
 ) -> kcp::Result<()> {
     log::trace!("start kcp checker at {:?}", std::thread::current().name());
 
+    let mut poller_fut = poller_fut;
     let mut pause_poller = true;
 
     loop {
@@ -338,7 +372,7 @@ pub async fn run_async_update<A: ConvAllocator>(
             if pause_poller {
                 Poll::Pending
             } else {
-                Pin::new(&mut poller).poll(cx)
+                Pin::new(&mut poller_fut).poll(cx)
             }
         });
 
@@ -367,68 +401,38 @@ pub async fn run_async_update<A: ConvAllocator>(
     }
 }
 
-impl<A: ConvAllocator> Future for KcpPoller<A> {
-    type Output = kcp::Result<()>;
+fn poll_update<A>(_cx: &mut std::task::Context<'_>, sessions: &mut Vec<SafeKcp<A>>) -> Duration
+where
+    A: ConvAllocator,
+{
+    let mut nex_chk = 0;
 
-    fn poll(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Self::Output> {
-        let mut this = self.0.lock().unwrap();
+    sessions.retain_mut(|kcp| {
+        let now = now_mills();
 
-        loop {
-            if this.session.is_empty() {
-                this.waker = Some(cx.waker().clone());
-                break;
-            }
+        if kcp.closed() {
+            return false;
+        }
 
-            let mut fut = match this.sleep_fut.take() {
-                Some(fut) => fut,
-                None => {
-                    let mut nex_chk = 0;
-
-                    this.session.retain_mut(|kcp| {
-                        let now = now_mills();
-
-                        if kcp.closed() {
-                            return false;
-                        }
-
-                        if kcp.updatable(now) {
-                            if let Err(_) = kcp.update(now) {
-                                kcp.force_close();
-                                return false;
-                            } else {
-                                kcp.try_wake_all();
-                            }
-                        }
-
-                        nex_chk = if nex_chk == 0 {
-                            kcp.check(now) - now
-                        } else {
-                            kcp.check(now).sub(now).min(nex_chk)
-                        };
-
-                        true
-                    });
-
-                    this.timer.sleep(Duration::from_millis(nex_chk as u64))
-                }
-            };
-
-            match Pin::new(&mut fut).poll(cx) {
-                std::task::Poll::Ready(()) => {
-                    continue;
-                }
-                std::task::Poll::Pending => {
-                    this.sleep_fut = Some(fut);
-                    break;
-                }
+        if kcp.updatable(now) {
+            if let Err(_) = kcp.update(now) {
+                kcp.force_close();
+                return false;
+            } else {
+                kcp.try_wake_all();
             }
         }
 
-        std::task::Poll::Pending
-    }
+        nex_chk = if nex_chk == 0 {
+            kcp.check(now) - now
+        } else {
+            kcp.check(now).sub(now).min(nex_chk)
+        };
+
+        true
+    });
+
+    Duration::from_millis(nex_chk as u64)
 }
 
 impl<A: ConvAllocator> Clone for SafeKcp<A> {

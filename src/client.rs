@@ -3,7 +3,8 @@ use std::ffi::c_void;
 
 use std::future::Future;
 use std::io;
-use std::ops::Add;
+use std::marker::PhantomData;
+
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -17,9 +18,9 @@ use std::task::Poll;
 
 use crate::{kcp::ConvAllocator, KcpStream};
 
-#[derive(Clone, Debug, Default)]
 struct KcpConv {
     conv: Arc<Mutex<u32>>,
+    manager: KcpManager,
 }
 
 struct ManagerImpl {
@@ -38,10 +39,10 @@ struct KcpCore(SafeKcp<KcpConv>);
 struct KcpManager(Arc<Mutex<ManagerImpl>>);
 
 pub struct KcpConnector<IO: Clone> {
-    io: IO,
     allocate: KcpConv,
     manager: KcpManager,
     poller: KcpPoller<KcpConv>,
+    _marked: PhantomData<IO>,
 }
 
 pub struct ClientImpl {
@@ -49,6 +50,8 @@ pub struct ClientImpl {
     core: KcpCore,
     manager: KcpManager,
 }
+
+unsafe impl<IO: Clone> Send for KcpConnector<IO> {}
 
 impl<IO> KcpConnector<IO>
 where
@@ -60,7 +63,7 @@ where
         Runtime: KcpRuntime,
     {
         let snd_que = Queue::<Vec<u8>>::new(1024).split();
-        let poller = KcpPoller::new(Runtime::timer());
+        let (poller, poller_fut) = KcpPoller::new(Runtime::timer());
 
         let kcp_read_signal = signal::signal(10);
         let kcp_update_signal = signal::signal(10);
@@ -85,7 +88,7 @@ where
             ))),
             Processor(Box::pin(poller::run_async_update(
                 kcp_update_signal.1,
-                poller.clone(),
+                poller_fut,
             ))),
             Processor(Box::pin(Self::run_async_write(
                 kcp_read_sig_0,
@@ -102,11 +105,16 @@ where
             Runtime::Runner::call(process)?;
         }
 
+        let conv_allocate = KcpConv {
+            conv: Arc::new(Mutex::new(1)),
+            manager: manager.clone(),
+        };
+
         Ok(KcpConnector {
-            io,
             manager,
             poller,
-            allocate: KcpConv::default(),
+            allocate: conv_allocate,
+            _marked: PhantomData,
         })
     }
 
@@ -140,9 +148,9 @@ where
 
         let kcp = SafeKcp::wrap(kcp);
 
-        self.poller.register(kcp.clone());
+        self.poller.register(kcp.clone()).await?;
 
-        let core = KcpCore::new(kcp);
+        let core = KcpCore(kcp);
 
         self.manager.manage(conv, core.clone()).await?;
 
@@ -207,13 +215,13 @@ where
 
             if clean_now {
                 log::trace!("clean kcp session: conv={}", conv);
-                manager.remove(conv);
+                manager.remove_kcp(conv);
             }
         }
     }
 
     async fn run_async_write(
-        sig: Arc<SigWrite<KcpReadSig>>,
+        _sig: Arc<SigWrite<KcpReadSig>>,
         snd_que: ReadHalf<Vec<u8>>,
         mut io: IO,
     ) -> kcp::Result<()> {
@@ -275,8 +283,9 @@ where
                         log::trace!("connection has been reset");
                     }
 
-                    manager.close_all();
+                    manager.close_all_session();
                     manager.stop_all_processor();
+
                     break Err(e.into());
                 }
                 signal::Sig::Data(Ok(n)) => {
@@ -286,8 +295,8 @@ where
                             log::trace!("kcp session not found. discard it conv: {}", conv);
                         }
                         Some(core) => {
-                            if let Err(e) = core.input(&buf[..n]).await {
-                                log::trace!("error {:?}", e);
+                            if let Err(_) = poll_fn(|cx| core.0.poll_input(cx, &buf[..n])).await {
+                                manager.remove_kcp(conv);
                             }
                         }
                     }
@@ -300,15 +309,22 @@ where
 impl ConvAllocator for KcpConv {
     fn allocate(&mut self) -> kcp::Result<kcp::CONV_T> {
         let mut conv = self.conv.lock().unwrap();
-        *conv = conv.add(1);
+        let manager = self.manager.0.lock().unwrap();
+
+        let last_conv = *conv;
+
+        while manager.sessions.contains_key(&conv) {
+            let (nex_conv, overflow) = conv.overflowing_add(1);
+            *conv = if overflow { 1 } else { nex_conv };
+            if *conv == last_conv {
+                return Err(kcp::KcpError::NoMoreConv);
+            }
+        }
+
         Ok(*conv)
     }
 
-    fn deallocate(&mut self, conv: kcp::CONV_T) {}
-}
-
-impl Processor {
-    fn stop(&mut self) {}
+    fn deallocate(&mut self, _conv: kcp::CONV_T) {}
 }
 
 impl AsyncWrite for ClientImpl {
@@ -317,21 +333,21 @@ impl AsyncWrite for ClientImpl {
         cx: &mut std::task::Context<'_>,
         buf: &[u8],
     ) -> std::task::Poll<std::io::Result<usize>> {
-        self.core.poll_write(cx, buf)
+        self.core.0.poll_send(cx, buf)
     }
 
     fn poll_flush(
         self: Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
-        unimplemented!()
+        self.core.0.poll_flush(cx)
     }
 
     fn poll_close(
         self: Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
-        unimplemented!()
+        self.core.0.poll_close(cx)
     }
 }
 
@@ -341,37 +357,24 @@ impl AsyncRead for ClientImpl {
         cx: &mut std::task::Context<'_>,
         buf: &mut [u8],
     ) -> std::task::Poll<std::io::Result<usize>> {
-        self.core.poll_read(cx, buf)
-    }
-}
-
-impl<IO> Drop for KcpConnector<IO>
-where
-    IO: Clone,
-{
-    fn drop(&mut self) {
-        let mgr = self.manager.0.lock().unwrap();
-
-        mgr.snd_que.close();
-        mgr.kcp_read_sig.close();
-        mgr.kcp_update_sig.close();
+        self.core.0.poll_recv(cx, buf)
     }
 }
 
 impl KcpManager {
     async fn manage(&self, conv: u32, kcp: KcpCore) -> kcp::Result<()> {
-        let mut mgr = self.0.lock().unwrap();
+        let mut this = self.0.lock().unwrap();
 
-        mgr.sessions.insert(conv, kcp);
+        this.sessions.insert(conv, kcp);
 
-        mgr.kcp_update_sig.send(KcpUpdateSig::Resume).await?;
-        mgr.kcp_read_sig.send(KcpReadSig::Resume).await?;
-
-        mgr.poller.wake();
+        this.kcp_read_sig.send(KcpReadSig::Resume).await?;
+        this.kcp_update_sig.send(KcpUpdateSig::Resume).await?;
 
         Ok(())
     }
+}
 
+impl KcpManager {
     fn output(&self, data: &[u8]) -> i32 {
         let this = self.0.lock().unwrap();
 
@@ -384,20 +387,23 @@ impl KcpManager {
         data.len() as i32
     }
 
-    fn remove(&self, conv: u32) {
-        self.0
-            .lock()
-            .unwrap()
-            .sessions
-            .remove(&conv)
-            .map(|kcp| kcp.0.force_close());
+    fn remove_kcp(&self, conv: u32) {
+        if let Some(kcp) = self.0.lock().unwrap().sessions.remove(&conv) {
+            kcp.0.force_close()
+        }
     }
 
     fn lookup(&self, conv: u32) -> Option<KcpCore> {
         self.0.lock().unwrap().sessions.get(&conv).map(Clone::clone)
     }
 
-    fn close_all(&self) {
+    fn close_kcp(&self, conv: u32) {
+        if let Err(e) = self.0.lock().unwrap().kcp_closer.block_send(conv) {
+            log::error!("{:?}", e);
+        };
+    }
+
+    fn close_all_session(&self) {
         let this = self.0.lock().unwrap();
 
         let count = this.sessions.len();
@@ -409,47 +415,36 @@ impl KcpManager {
         log::trace!("{} sessions were forcibly closed", count)
     }
 
-    fn close_kcp(&self, conv: u32) {
-        if let Err(e) = self.0.lock().unwrap().kcp_closer.block_send(conv) {
-            log::error!("{:?}", e);
-        };
-    }
-
     fn stop_all_processor(&self) {
         let this = self.0.lock().unwrap();
+        this.poller.stop();
+        this.kcp_closer.close();
         this.kcp_read_sig.close();
         this.kcp_update_sig.close();
     }
 }
 
-impl KcpCore {
-    fn new(kcp: SafeKcp<KcpConv>) -> Self {
-        KcpCore(kcp)
-    }
-
-    async fn input(&self, data: &[u8]) -> kcp::Result<()> {
-        poll_fn(|cx| self.0.poll_input(cx, data)).await
-    }
-
-    fn poll_read(
-        &mut self,
-        cx: &mut std::task::Context<'_>,
-        buf: &mut [u8],
-    ) -> Poll<std::io::Result<usize>> {
-        self.0.poll_recv(cx, buf)
-    }
-
-    fn poll_write(
-        &mut self,
-        cx: &mut std::task::Context<'_>,
-        buf: &[u8],
-    ) -> Poll<std::io::Result<usize>> {
-        self.0.poll_send(cx, buf)
+impl Clone for KcpConv {
+    fn clone(&self) -> Self {
+        Self {
+            conv: self.conv.clone(),
+            manager: self.manager.clone(),
+        }
     }
 }
 
 impl Drop for ClientImpl {
     fn drop(&mut self) {
         self.manager.close_kcp(self.conv);
+    }
+}
+
+impl<IO> Drop for KcpConnector<IO>
+where
+    IO: Clone,
+{
+    fn drop(&mut self) {
+        self.manager.close_all_session();
+        self.manager.stop_all_processor();
     }
 }

@@ -3,6 +3,7 @@ use std::ffi::c_void;
 use std::future::Future;
 use std::hash::{Hash, Hasher};
 use std::io;
+use std::marker::PhantomData;
 use std::net::SocketAddr;
 use std::sync::Mutex;
 use std::task::Poll;
@@ -28,18 +29,17 @@ struct ManagerImpl {
 
 #[derive(Clone)]
 struct KcpManager {
+    inner: Arc<Mutex<ManagerImpl>>,
     poller: KcpPoller<RemoteConv>,
     poller_sig: Arc<SigWrite<KcpUpdateSig>>,
-    inner: Arc<Mutex<ManagerImpl>>,
-    closer: Arc<WriteHalf<(u64, u32)>>,
-    kcp_data_sender: Arc<WriteHalf<(SocketAddr, Vec<u8>)>>,
+    kcp_closer: Arc<WriteHalf<(u64, u32)>>,
+    kcp_sender: Arc<WriteHalf<(SocketAddr, Vec<u8>)>>,
 }
 
 pub struct KcpListener<IO> {
-    io: IO,
     manager: KcpManager,
-    poller: KcpPoller<RemoteConv>,
     kcp_receiver: ReadHalf<KcpStream<ServerImpl>>,
+    _marked: PhantomData<IO>,
 }
 
 #[derive(Clone)]
@@ -51,6 +51,7 @@ pub struct ServerImpl {
     kcp: KcpCore,
     id: u64,
     conv: u32,
+    #[allow(unused)]
     addr: SocketAddr,
     manager: KcpManager,
 }
@@ -60,10 +61,8 @@ pub struct KcpOutput {
     manager: KcpManager,
 }
 
-pub enum KcpCloseState {
-    Close(u64, u32),
-    Prepare(u64, u32),
-}
+
+unsafe impl<IO> Send for KcpListener<IO> {}
 
 impl<IO> KcpListener<IO>
 where
@@ -74,7 +73,7 @@ where
         R: KcpRuntime,
     {
         let sessions = HashMap::new();
-        let kcp_poller = KcpPoller::new(R::timer());
+        let (kcp_poller, poller_fut) = KcpPoller::new(R::timer());
         let acceptor = Queue::new(10).split();
         let closer = Queue::new(255).split();
         let kcp_update_sig = signal(10);
@@ -82,10 +81,10 @@ where
 
         let kcp_manager = KcpManager {
             poller: kcp_poller.clone(),
-            closer: Arc::new(closer.0),
+            kcp_closer: Arc::new(closer.0),
             poller_sig: Arc::new(kcp_update_sig.0),
             inner: Arc::new(Mutex::new(ManagerImpl { sessions })),
-            kcp_data_sender: Arc::new(kcp_sender.0),
+            kcp_sender: Arc::new(kcp_sender.0),
         };
 
         let processors = vec![
@@ -96,7 +95,7 @@ where
             ))),
             Processor(Box::pin(poller::run_async_update(
                 kcp_update_sig.1,
-                kcp_poller.clone(),
+                poller_fut,
             ))),
             Processor(Box::pin(Self::kcp_async_send(io.clone(), kcp_sender.1))),
             Processor(Box::pin(Self::kcp_async_close(
@@ -110,10 +109,9 @@ where
         }
 
         Ok(KcpListener {
-            io,
-            poller: kcp_poller,
             manager: kcp_manager,
             kcp_receiver: acceptor.1,
+            _marked: PhantomData,
         })
     }
 
@@ -147,12 +145,9 @@ where
                     std::task::Poll::Ready((id, conv)) => match manager.lookup(id, conv) {
                         None => Poll::Ready(kcp::Result::Ok((false, id, conv))),
                         Some(kcp) => {
-                            futures.push(poll_fn(move |cx| {
-                                let poll = match kcp.poll_close(cx) {
-                                    std::task::Poll::Pending => std::task::Poll::Pending,
-                                    std::task::Poll::Ready(_) => std::task::Poll::Ready((id, conv)),
-                                };
-                                poll
+                            futures.push(poll_fn(move |cx| match kcp.poll_close(cx) {
+                                std::task::Poll::Pending => std::task::Poll::Pending,
+                                std::task::Poll::Ready(_) => std::task::Poll::Ready((id, conv)),
                             }));
 
                             Poll::Ready(Ok((false, id, conv)))
@@ -239,7 +234,7 @@ where
                             kcp.force_close();
                         }
                         Ok(()) => {
-                            manager.manage(hash_id, conv, kcp.clone())?;
+                            manager.manage(hash_id, conv, kcp.clone()).await?;
 
                             let kcp = KcpStream(ServerImpl {
                                 id: hash_id,
@@ -271,13 +266,10 @@ impl std::ops::DerefMut for KcpCore {
     }
 }
 
-impl KcpCore {
-    fn close() {}
-}
-
 impl KcpManager {
-    fn manage(&self, id: u64, conv: u32, kcp: KcpCore) -> std::io::Result<()> {
-        self.poller.register(kcp.kcp.clone());
+    async fn manage(&self, id: u64, conv: u32, kcp: KcpCore) -> std::io::Result<()> {
+        self.poller.register(kcp.kcp.clone()).await?;
+
         self.inner
             .lock()
             .unwrap()
@@ -289,14 +281,17 @@ impl KcpManager {
     }
 
     fn remove(&self, id: u64, conv: u32) {
-        self.inner
+        if let Some(kcp) = self
+            .inner
             .lock()
             .unwrap()
             .sessions
             .entry(id)
             .or_default()
             .remove(&conv)
-            .map(|kcp| kcp.force_close());
+        {
+            kcp.force_close()
+        }
     }
 
     fn lookup(&self, id: u64, conv: u32) -> Option<KcpCore> {
@@ -311,7 +306,7 @@ impl KcpManager {
     }
 
     fn close_kcp(&self, id: u64, conv: u32) {
-        if let Err(e) = self.closer.block_send((id, conv)) {
+        if let Err(e) = self.kcp_closer.block_send((id, conv)) {
             log::error!("{:?}", e);
         }
     }
@@ -352,12 +347,30 @@ impl KcpManager {
     fn kcp_cleanup(user: *mut c_void) {
         unsafe { drop(Box::from_raw(user as *mut KcpOutput)) }
     }
+
+    fn close_all_session(&self) {
+        let mut this = self.inner.lock().unwrap();
+
+        for (_, sessions) in &mut this.sessions {
+            for (_, kcp) in sessions {
+                kcp.force_close();
+            }
+        }
+
+        this.sessions.clear();
+    }
+
+    fn stop_all_processor(&self) {
+        self.kcp_closer.close();
+        self.kcp_sender.close();
+        self.poller_sig.close();
+    }
 }
 
 impl KcpOutput {
     fn output(&self, data: &[u8]) -> i32 {
         self.manager
-            .kcp_data_sender
+            .kcp_sender
             .block_send((self.to, data.to_vec()))
             .unwrap();
         data.len() as i32
@@ -401,5 +414,12 @@ impl AsyncWrite for ServerImpl {
 impl Drop for ServerImpl {
     fn drop(&mut self) {
         self.manager.close_kcp(self.id, self.conv)
+    }
+}
+
+impl<IO> Drop for KcpListener<IO> {
+    fn drop(&mut self) {
+        self.manager.close_all_session();
+        self.manager.stop_all_processor();
     }
 }

@@ -10,6 +10,7 @@ pub type Result<T> = std::result::Result<T, KcpError>;
 #[derive(Debug)]
 pub enum KcpError {
     Core(KcpErrorKind),
+    NoMoreConv,
     ReadTimeout(u32),
     WriteTimeout(u32),
     Closed,
@@ -37,7 +38,7 @@ impl<'a, A> From<PoisonError<MutexGuard<'a, Kcp<A>>>> for KcpError
 where
     A: ConvAllocator,
 {
-    fn from(value: PoisonError<MutexGuard<'a, Kcp<A>>>) -> Self {
+    fn from(_value: PoisonError<MutexGuard<'a, Kcp<A>>>) -> Self {
         unimplemented!()
     }
 }
@@ -51,12 +52,13 @@ impl From<std::io::Error> for KcpError {
 impl From<KcpError> for io::Error {
     fn from(kcp_err: KcpError) -> Self {
         match kcp_err {
-            KcpError::Core(coew) => todo!(),
+            KcpError::Core(_coew) => todo!(),
             KcpError::WriteTimeout(_) => todo!(),
             KcpError::SignalReadClosed => todo!(),
             KcpError::SignalSendClosed => todo!(),
             KcpError::Closed => todo!(),
             KcpError::ReadTimeout(_) => todo!(),
+            KcpError::NoMoreConv => todo!(),
         }
     }
 }

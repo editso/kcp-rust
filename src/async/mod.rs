@@ -110,7 +110,7 @@ where
     type Output = std::io::Result<usize>;
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> std::task::Poll<Self::Output> {
         let mut this = self.project();
-        Pin::new(&mut **this.reader).poll_read(cx, &mut *this.buf)
+        Pin::new(&mut **this.reader).poll_read(cx, &mut this.buf)
     }
 }
 
@@ -121,11 +121,11 @@ where
     type Output = std::io::Result<usize>;
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> std::task::Poll<Self::Output> {
         let this = self.project();
-        Pin::new(&mut **this.writer).poll_write(cx, &*this.buf)
+        Pin::new(&mut **this.writer).poll_write(cx, &this.buf)
     }
 }
 
-pub fn poll_fn<F, O>(f: F) -> PollFn<F>
+pub(crate) fn poll_fn<F, O>(f: F) -> PollFn<F>
 where
     F: FnMut(&mut Context<'_>) -> Poll<O>,
 {

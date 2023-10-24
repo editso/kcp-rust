@@ -1,5 +1,5 @@
 use std::io;
-use std::task::{Poll, Waker};
+use std::task::Poll;
 use std::{future::Future, pin::Pin, sync::Arc};
 
 use std::sync::Mutex;
@@ -24,21 +24,18 @@ pub struct SignalImpl<T: Unpin> {
     send_closed: bool,
 }
 
+#[allow(unused)]
 pub enum KcpReadSig {
     Quit,
     Pause,
     Resume,
 }
 
+#[allow(unused)]
 pub enum KcpUpdateSig {
     Pause,
     Stop,
     Resume,
-}
-
-pub enum KcpCloseSig {
-    Quit,
-    Close(u32),
 }
 
 pub struct SigRead<T: Unpin>(Arc<Mutex<SignalImpl<T>>>);
@@ -95,22 +92,6 @@ pub fn signal<T: Unpin>(size: usize) -> (SigWrite<T>, SigRead<T>) {
     }));
 
     (SigWrite(signal.clone()), SigRead(signal))
-}
-
-impl<S: Unpin> Drop for SigWrite<S> {
-    fn drop(&mut self) {
-        let mut this = self.0.lock().unwrap();
-        this.send_closed = true;
-        this.que.close();
-    }
-}
-
-impl<S: Unpin> Drop for SigRead<S> {
-    fn drop(&mut self) {
-        let mut this = self.0.lock().unwrap();
-        this.read_closed = true;
-        this.que.close();
-    }
 }
 
 impl<T: Unpin> SigWrite<T> {
@@ -170,100 +151,14 @@ impl<T: Unpin> SigRead<T> {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use std::{
-        ffi::c_void,
-        future::Future,
-        pin::Pin,
-        sync::{mpsc::channel, Arc, Mutex},
-        task::Poll,
-        time::Duration,
-    };
-
-    use smol::future::FutureExt;
-
-    use crate::r#async::poll_fn;
-
-    use super::{poll_signal_or, signal, KcpReadSig};
-
-    #[test]
-    fn test_signal() {
-        smol::block_on(async move {
-            let (ax, rx) = smol::channel::unbounded();
-
-            let (cx, bx) = signal(10);
-            let cx = Arc::new(cx);
-            // let (sw, sr) = signal(10);
-            // let cxx = cx.clone();
-            std::thread::spawn(move || {
-                smol::block_on(async move {
-                    // let sr = sr;
-                    ax.send(1);
-                    cx.send(1).await;
-                    let k = 0;
-                    panic!();
-                })
-            });
-
-            loop {
-                // if let Err(e) = bx.recv().await {
-                //     println!("error 2222");
-                //     break;
-                // }
-
-                if let Err(e) = bx.recv().await {
-                    println!("{:?}", e);
-                    break;
-                }
-            }
-
-            // let a = sw.send(1).await.unwrap();
-        })
+impl<S: Unpin> Drop for SigWrite<S> {
+    fn drop(&mut self) {
+        self.close();
     }
+}
 
-    #[test]
-    fn test_signal_1() {
-        env_logger::builder()
-            .filter_level(log::LevelFilter::Debug)
-            .init();
-
-        smol::block_on(async move {
-            // let sig = signal(10);
-
-            let k = Arc::new(Mutex::new(None));
-            let s = signal(1);
-
-            let mut a = Box::pin(async move {
-                loop {
-                    log::debug!("ready ....");
-
-                    poll_fn(|cx| {
-                        let mut fut = Box::pin(async move {
-                            smol::Timer::after(Duration::from_secs(1)).await;
-                        });
-
-                        match Pin::new(&mut fut).poll(cx) {
-                            Poll::Ready(_) => Poll::Ready(()),
-                            Poll::Pending => {
-                                log::debug!("pending ....");
-                                *k.lock().unwrap() = Some(fut);
-                                Poll::Pending
-                            }
-                        }
-                    })
-                    .await;
-                }
-            });
-
-            s.0.send(1).await;
-
-            loop {
-                log::debug!("run ....");
-                let f = poll_fn(|cx| Pin::new(&mut a).poll(cx));
-
-                let r = poll_signal_or(f, s.1.recv()).await;
-            }
-        })
+impl<S: Unpin> Drop for SigRead<S> {
+    fn drop(&mut self) {
+        self.close();
     }
 }

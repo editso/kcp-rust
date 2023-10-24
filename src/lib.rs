@@ -2,13 +2,19 @@ mod r#async;
 mod client;
 mod kcp;
 mod poller;
+
 mod queue;
 mod server;
 mod signal;
 
 use std::{future::Future, pin::Pin};
 
-use r#async::{AsyncRead, AsyncWrite};
+pub use kcp::KcpConfig;
+pub use poller::Timer;
+pub use r#async::*;
+
+pub use client::{ClientImpl, KcpConnector};
+pub use server::{KcpListener, ServerImpl};
 
 pub struct KcpStream<T>(T);
 
@@ -24,7 +30,7 @@ pub trait KcpRuntime: Sized {
 
     type Runner: Runner<Err = Self::Err>;
 
-    type Timer: poller::Timer + Send + 'static;
+    type Timer: poller::Timer + Send + Sync + 'static;
 
     fn timer() -> Self::Timer;
 }
@@ -86,16 +92,13 @@ mod tests {
     use std::pin::Pin;
     use std::sync::Arc;
     use std::thread;
-    use std::time::Duration;
 
-    use smol::future::{self, FutureExt};
+    use smol::future::FutureExt;
     use smol::io;
 
-    use crate::r#async::{
-        AsyncReadExt, AsyncRecv, AsyncRecvfrom, AsyncSend, AsyncSendTo, AsyncWriteExt,
-    };
-    use crate::{client, kcp, poller, KcpStream, Processor};
+    use crate::r#async::{AsyncRecv, AsyncRecvfrom, AsyncSend, AsyncSendTo};
     use crate::{client::KcpConnector, server::KcpListener};
+    use crate::{kcp, poller, KcpStream, Processor};
 
     #[derive(Clone)]
     pub struct UdpSocket {
@@ -199,7 +202,7 @@ mod tests {
             let mut fut = this.take().unwrap_or_else(|| {
                 let udp = self.inner.clone();
                 let mut buf = buf.to_vec();
-                let addr = addr.clone();
+                let addr = *addr;
                 Box::pin(async move {
                     let n = udp.send_to(&mut buf, addr).await?;
                     std::io::Result::Ok(n)
@@ -262,11 +265,11 @@ mod tests {
     struct KcpTimer;
 
     impl poller::Timer for KcpTimer {
-        fn sleep(&self, time: std::time::Duration) -> poller::BoxedFuture<()> {
-            Box::pin(async move {
-                // log::debug!("sleep {:?}", time);
-                smol::Timer::after(time).await;
-            })
+        type Ret = std::time::Instant;
+        type Output = smol::Timer;
+
+        fn sleep(&self, time: std::time::Duration) -> Self::Output {
+            smol::Timer::after(time)
         }
     }
 
@@ -373,11 +376,18 @@ mod tests {
         }
     }
 
+
+    #[test]
+    fn overflow_test(){
+        let a = 1u8.overflowing_add(255);
+        println!("{:?}", a);
+    }
+
     #[test]
     fn test_kcp_client() -> kcp::Result<()> {
         let executor = Arc::new(smol::Executor::<'_>::new());
 
-        for i in 1..10 {
+        for _i in 1..10 {
             let executor = executor.clone();
             thread::spawn(move || loop {
                 smol::block_on(executor.run(smol::future::pending()))
@@ -416,8 +426,6 @@ mod tests {
                     })
                     .detach();
             }
-
-            Ok(())
         })
     }
 
@@ -429,7 +437,7 @@ mod tests {
 
         let executor = Arc::new(smol::Executor::<'_>::new());
 
-        for i in 1..10 {
+        for _i in 1..10 {
             let executor = executor.clone();
             thread::spawn(move || loop {
                 smol::block_on(executor.run(smol::future::pending()))

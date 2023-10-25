@@ -12,34 +12,40 @@ pub struct User {
     drop: fn(*mut std::ffi::c_void),
 }
 
-#[derive(Clone, Debug, Copy)]
+#[derive(Clone, Debug, Copy, PartialEq, Eq)]
 pub struct KcpConfig {
-    nc: bool,
-    timeout: u32,
-    nodelay: bool,
-    interval: i32,
-    resend: i32,
-    window_size: i32,
-    close_delay: u32,
+    pub nc: bool,
+    pub mtu: u32,
+    pub timeout: u32,
+    pub nodelay: bool,
+    pub interval: i32,
+    pub resend: i32,
+    pub rcvwnd_size: i32,
+    pub sndwnd_size: i32,
+    pub close_delay: u32,
 }
 
 pub const FAST_MODE: KcpConfig = KcpConfig {
     nc: true,
+    mtu: 1400,
     timeout: 15000,
     nodelay: true,
-    interval: 10,
+    interval: 5,
     resend: 2,
-    window_size: 2048,
+    rcvwnd_size: 2048,
+    sndwnd_size: 2048,
     close_delay: 10000,
 };
 
 pub const NORMAL_MODE: KcpConfig = KcpConfig {
     nc: false,
+    mtu: 1400,
     timeout: 15000,
     nodelay: false,
     interval: 40,
     resend: 0,
-    window_size: 512,
+    rcvwnd_size: 1024,
+    sndwnd_size: 512,
     close_delay: 15000,
 };
 
@@ -89,7 +95,8 @@ where
         }
 
         unsafe {
-            ikcp::wndsize(ikcp, config.window_size, config.window_size);
+            ikcp::setmtu(ikcp, config.mtu as i32);
+            ikcp::wndsize(ikcp, config.sndwnd_size, config.rcvwnd_size);
 
             ikcp::nodelay(
                 ikcp,
@@ -186,8 +193,8 @@ where
         unsafe { ikcp::setoutput(self.ikcp, output) }
     }
 
-    pub fn wndsize(&self) -> i32 {
-        self.config.window_size
+    pub fn sndwnd_size(&self) -> i32 {
+        self.config.sndwnd_size
     }
 
     pub fn close_delay(&self) -> u32 {

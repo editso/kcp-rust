@@ -24,10 +24,13 @@ pub struct KcpImpl<A: ConvAllocator> {
     last_recv: u32,
     send_closed: bool,
     recv_closed: bool,
-    next_update: u32,
+    last_update: u32,
     close_delay: u32,
     recv_timeout: u32,
     send_timeout: u32,
+    next_update: u32,
+    close_flag: u32,
+    clsck_inc: u32,
     recv_waker: Option<Waker>,
     send_waker: Option<Waker>,
     close_waker: Option<Waker>,
@@ -69,11 +72,14 @@ impl<A: ConvAllocator> SafeKcp<A> {
             send_waker: None,
             close_waker: None,
             flush_waker: None,
-            next_update: now,
+            last_update: now,
             send_closed: false,
             recv_closed: false,
             recv_timeout: timeout,
             send_timeout: timeout,
+            next_update: now,
+            close_flag: 0,
+            clsck_inc: 0,
         })))
     }
 
@@ -109,8 +115,16 @@ impl<A: ConvAllocator> SafeKcp<A> {
     }
 
     pub fn check(&self, now: u32) -> u32 {
-        let this = self.0.lock().unwrap();
-        this.inner.check(now)
+        let mut this = self.0.lock().unwrap();
+
+        this.next_update = this.inner.check(now);
+
+        if this.close_flag == 1 {
+            // close it slowly 10ms
+            this.clsck_inc += 10;
+        }
+
+        this.next_update + this.clsck_inc
     }
 
     pub fn closed(&self) -> bool {
@@ -123,7 +137,7 @@ impl<A: ConvAllocator> SafeKcp<A> {
             true
         } else {
             let now_time = self.check(now);
-            self.0.lock().unwrap().next_update <= now_time
+            self.0.lock().unwrap().last_update <= now_time
         }
     }
 
@@ -204,6 +218,8 @@ impl<A: ConvAllocator> SafeKcp<A> {
             let mut this = self.0.lock().unwrap();
             match this.inner.input(pkt) {
                 Ok(_) => {
+                    this.clsck_inc = 0;
+                    this.last_update = 0;
                     this.last_send = now_mills();
                     Ok(())
                 }
@@ -231,7 +247,7 @@ impl<A: ConvAllocator> SafeKcp<A> {
         let mut this = self.0.lock().unwrap();
         if this.send_closed {
             Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()))
-        } else if this.inner.waitsnd() >= this.inner.wndsize() as u32 {
+        } else if this.inner.waitsnd() >= (this.inner.sndwnd_size() / 2) as u32 {
             this.send_waker = Some(cx.waker().clone());
             Poll::Pending
         } else {
@@ -288,7 +304,9 @@ impl<A: ConvAllocator> SafeKcp<A> {
 
         let mut this = self.0.lock().unwrap();
         let (diff, overflow) = now_mills().overflowing_sub(this.last_send);
+
         if this.inner.waitsnd() > 0 || overflow || diff < this.close_delay {
+            this.close_flag = 1;
             this.close_waker = Some(cx.waker().clone());
             Poll::Pending
         } else {
@@ -362,8 +380,6 @@ pub async fn run_async_update(
     signal: SigRead<KcpUpdateSig>,
     poller_fut: BoxedFuture<kcp::Result<()>>,
 ) -> kcp::Result<()> {
-    log::trace!("start kcp checker at {:?}", std::thread::current().name());
-
     let mut poller_fut = poller_fut;
     let mut pause_poller = true;
 

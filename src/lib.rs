@@ -13,16 +13,56 @@ pub use kcp::KcpConfig;
 pub use poller::Timer;
 pub use r#async::*;
 
+pub use kcp::{FAST_MODE, NORMAL_MODE};
 pub use client::{ClientImpl, KcpConnector};
 pub use server::{KcpListener, ServerImpl};
 
+macro_rules! background {
+    ($name: ident, $kind: ident) => {
+        impl Background {
+            pub(crate) fn $name<F>(fut: F) -> Self
+            where
+                F: Future<Output = kcp::Result<()>> + Send + 'static,
+            {
+                Self {
+                    future: Box::pin(fut),
+                    kind: TaskKind::$kind,
+                }
+            }
+        }
+    };
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Config {
+    pub rcvbuf_size: usize,
+    pub quebuf_size: usize,
+    pub kcp_config: KcpConfig,
+}
+
 pub struct KcpStream<T>(T);
 
-pub struct Processor(Pin<Box<dyn Future<Output = kcp::Result<()>> + Send + 'static>>);
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskKind {
+    Reader,
+    Sender,
+    Poller,
+    Closer,
+}
+
+pub struct Background {
+    kind: TaskKind,
+    future: Pin<Box<dyn Future<Output = kcp::Result<()>> + Send + 'static>>,
+}
+
+background!(new_poller, Poller);
+background!(new_closer, Closer);
+background!(new_reader, Reader);
+background!(new_sender, Sender);
 
 pub trait Runner: Sized {
     type Err;
-    fn call(process: Processor) -> std::result::Result<(), Self::Err>;
+    fn start(process: Background) -> std::result::Result<(), Self::Err>;
 }
 
 pub trait KcpRuntime: Sized {
@@ -35,14 +75,20 @@ pub trait KcpRuntime: Sized {
     fn timer() -> Self::Timer;
 }
 
-impl Future for Processor {
+impl Background {
+    pub fn kind(&self) -> TaskKind {
+        self.kind
+    }
+}
+
+impl Future for Background {
     type Output = kcp::Result<()>;
 
     fn poll(
         mut self: Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Self::Output> {
-        Pin::new(&mut self.0).poll(cx)
+        Pin::new(&mut self.future).poll(cx)
     }
 }
 
@@ -86,6 +132,16 @@ where
     }
 }
 
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            rcvbuf_size: 1500,
+            quebuf_size: 1024,
+            kcp_config: kcp::FAST_MODE,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::net::SocketAddr;
@@ -98,7 +154,7 @@ mod tests {
 
     use crate::r#async::{AsyncRecv, AsyncRecvfrom, AsyncSend, AsyncSendTo};
     use crate::{client::KcpConnector, server::KcpListener};
-    use crate::{kcp, poller, KcpStream, Processor};
+    use crate::{kcp, poller, Background, KcpStream};
 
     #[derive(Clone)]
     pub struct UdpSocket {
@@ -275,7 +331,7 @@ mod tests {
 
     impl crate::Runner for KcpRunner {
         type Err = io::Error;
-        fn call(process: Processor) -> std::result::Result<(), Self::Err> {
+        fn start(process: Background) -> std::result::Result<(), Self::Err> {
             std::thread::Builder::new()
                 .name("processor[kcp]".into())
                 .spawn(move || {
@@ -376,9 +432,8 @@ mod tests {
         }
     }
 
-
     #[test]
-    fn overflow_test(){
+    fn overflow_test() {
         let a = 1u8.overflowing_add(255);
         println!("{:?}", a);
     }
@@ -404,11 +459,12 @@ mod tests {
             udp.connect("127.0.0.1:9999").await?;
 
             let tcp_server = smol::net::TcpListener::bind("0.0.0.0:7777").await.unwrap();
-            let mut kcp_connector = KcpConnector::new::<KcpClientRuntime>(UdpSocket::new(udp))?;
+            let mut kcp_connector =
+                KcpConnector::new::<KcpClientRuntime>(UdpSocket::new(udp), Default::default())?;
 
             loop {
                 let (stream, _) = tcp_server.accept().await.unwrap();
-                let kcp = kcp_connector.open().await.unwrap();
+                let (_, kcp) = kcp_connector.open().await.unwrap();
 
                 executor
                     .spawn(async move {
@@ -448,10 +504,10 @@ mod tests {
             let udp = smol::net::UdpSocket::bind("127.0.0.1:9999").await.unwrap();
 
             let udp = UdpSocket::new(udp);
-            let kcp_server = KcpListener::new::<KcpClientRuntime>(udp).unwrap();
+            let kcp_server = KcpListener::new::<KcpClientRuntime>(udp, Default::default()).unwrap();
 
             loop {
-                let stream = kcp_server.accept().await.unwrap();
+                let (_, _, stream) = kcp_server.accept().await.unwrap();
                 let kcp = smol::net::TcpStream::connect("127.0.0.1:8888")
                     .await
                     .unwrap();

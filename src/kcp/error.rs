@@ -52,13 +52,32 @@ impl From<std::io::Error> for KcpError {
 impl From<KcpError> for io::Error {
     fn from(kcp_err: KcpError) -> Self {
         match kcp_err {
-            KcpError::Core(_coew) => todo!(),
-            KcpError::WriteTimeout(_) => todo!(),
-            KcpError::SignalReadClosed => todo!(),
-            KcpError::SignalSendClosed => todo!(),
-            KcpError::Closed => todo!(),
-            KcpError::ReadTimeout(_) => todo!(),
-            KcpError::NoMoreConv => todo!(),
+            KcpError::Closed => io::ErrorKind::BrokenPipe.into(),
+            KcpError::Core(kind) => kind.into(),
+            KcpError::WriteTimeout(_) => io::ErrorKind::TimedOut.into(),
+            KcpError::SignalReadClosed => io::ErrorKind::BrokenPipe.into(),
+            KcpError::SignalSendClosed => io::ErrorKind::BrokenPipe.into(),
+            KcpError::ReadTimeout(_) => io::ErrorKind::TimedOut.into(),
+            KcpError::NoMoreConv => io::Error::new(io::ErrorKind::AddrInUse, "conv exhausted"),
+        }
+    }
+}
+
+impl From<KcpErrorKind> for io::Error {
+    fn from(err_kind: KcpErrorKind) -> Self {
+        match err_kind {
+            KcpErrorKind::CreateFail => io::ErrorKind::OutOfMemory.into(),
+            KcpErrorKind::InputError(_) => io::ErrorKind::InvalidInput.into(),
+            KcpErrorKind::InvalidConv(_) => {
+                io::Error::new(io::ErrorKind::InvalidData, "invalid conv")
+            }
+            KcpErrorKind::UserDataToSmall(_) => {
+                io::Error::new(io::ErrorKind::Other, "buffer too small")
+            }
+            KcpErrorKind::InvalidCommand(_, _) => {
+                io::Error::new(io::ErrorKind::InvalidData, "invalid header")
+            }
+            KcpErrorKind::StdIoError(e) => e,
         }
     }
 }

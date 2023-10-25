@@ -10,7 +10,7 @@ use std::task::Poll;
 use std::{collections::HashMap, pin::Pin, sync::Arc};
 
 use crate::signal::KcpUpdateSig;
-use crate::{poller, Processor, Runner};
+use crate::{poller, Background, Config, KcpConfig, Runner};
 
 use crate::{
     kcp::{self, ConvAllocator},
@@ -38,7 +38,7 @@ struct KcpManager {
 
 pub struct KcpListener<IO> {
     manager: KcpManager,
-    kcp_receiver: ReadHalf<KcpStream<ServerImpl>>,
+    kcp_receiver: ReadHalf<(u32, SocketAddr, KcpStream<ServerImpl>)>,
     _marked: PhantomData<IO>,
 }
 
@@ -61,52 +61,57 @@ pub struct KcpOutput {
     manager: KcpManager,
 }
 
-
 unsafe impl<IO> Send for KcpListener<IO> {}
 
 impl<IO> KcpListener<IO>
 where
     IO: AsyncRecvfrom + AsyncSendTo + Send + Unpin + Clone + 'static,
 {
-    pub fn new<R>(io: IO) -> std::result::Result<Self, R::Err>
+    pub fn new<R>(io: IO, config: Config) -> std::result::Result<Self, R::Err>
     where
         R: KcpRuntime,
     {
+        let mut config = config;
         let sessions = HashMap::new();
         let (kcp_poller, poller_fut) = KcpPoller::new(R::timer());
         let acceptor = Queue::new(10).split();
-        let closer = Queue::new(255).split();
-        let kcp_update_sig = signal(10);
-        let kcp_sender = Queue::new(255).split();
+        let kcp_closer = Queue::new(255).split();
+        let kcp_update_sig = signal(255);
+        let kcp_sender = Queue::new(config.quebuf_size).split();
 
         let kcp_manager = KcpManager {
             poller: kcp_poller.clone(),
-            kcp_closer: Arc::new(closer.0),
+            kcp_closer: Arc::new(kcp_closer.0),
             poller_sig: Arc::new(kcp_update_sig.0),
             inner: Arc::new(Mutex::new(ManagerImpl { sessions })),
             kcp_sender: Arc::new(kcp_sender.0),
         };
 
+        config.rcvbuf_size = if config.rcvbuf_size < config.kcp_config.mtu as usize {
+            config.kcp_config.mtu as usize
+        } else {
+            config.rcvbuf_size
+        };
+
         let processors = vec![
-            Processor(Box::pin(Self::kcp_async_recv(
+            Background::new_poller(poller::run_async_update(kcp_update_sig.1, poller_fut)),
+            Background::new_sender(Self::kcp_async_send(io.clone(), kcp_sender.1)),
+            Background::new_closer(Self::kcp_async_close(kcp_closer.1, kcp_manager.clone())),
+            Background::new_reader(Self::kcp_async_recv(
                 io.clone(),
+                config,
                 kcp_manager.clone(),
                 acceptor.0,
-            ))),
-            Processor(Box::pin(poller::run_async_update(
-                kcp_update_sig.1,
-                poller_fut,
-            ))),
-            Processor(Box::pin(Self::kcp_async_send(io.clone(), kcp_sender.1))),
-            Processor(Box::pin(Self::kcp_async_close(
-                closer.1,
-                kcp_manager.clone(),
-            ))),
+            )),
         ];
 
         for process in processors {
-            R::Runner::call(process)?;
+            let kind = process.kind();
+            R::Runner::start(process)?;
+            log::trace!("kcp {:?} started", kind)
         }
+
+        log::debug!("config: {:#?}", config);
 
         Ok(KcpListener {
             manager: kcp_manager,
@@ -115,7 +120,7 @@ where
         })
     }
 
-    pub async fn accept(&self) -> kcp::Result<KcpStream<ServerImpl>> {
+    pub async fn accept(&self) -> kcp::Result<(u32, SocketAddr, KcpStream<ServerImpl>)> {
         Ok(self.kcp_receiver.recv().await?)
     }
 }
@@ -187,13 +192,15 @@ where
     }
 
     async fn kcp_async_recv(
-        mut io: IO,
+        io: IO,
+        config: Config,
         manager: KcpManager,
-        acc_receiver: WriteHalf<KcpStream<ServerImpl>>,
+        acc_receiver: WriteHalf<(u32, SocketAddr, KcpStream<ServerImpl>)>,
     ) -> kcp::Result<()> {
+        let mut io = io;
         let mut buf = unsafe {
-            let mut buf = Vec::with_capacity(1500);
-            buf.set_len(1500);
+            let mut buf = Vec::with_capacity(config.rcvbuf_size);
+            buf.set_len(config.rcvbuf_size);
             buf
         };
 
@@ -227,7 +234,8 @@ where
                     };
                 }
                 None => {
-                    let kcp = manager.make_kcp(addr, conv).unwrap();
+                    let kcp = manager.make_kcp(config.kcp_config, addr, conv).unwrap();
+
                     match poll_fn(|cx| kcp.poll_input(cx, &buf[..n])).await {
                         Err(e) => {
                             log::warn!("call kcp input {:?}", e);
@@ -244,7 +252,7 @@ where
                                 manager: manager.clone(),
                             });
 
-                            acc_receiver.send(kcp).await?;
+                            acc_receiver.send((conv, addr, kcp)).await?;
                         }
                     }
                 }
@@ -311,7 +319,7 @@ impl KcpManager {
         }
     }
 
-    fn make_kcp(&self, addr: SocketAddr, conv: u32) -> kcp::Result<KcpCore> {
+    fn make_kcp(&self, kcp_config: KcpConfig, addr: SocketAddr, conv: u32) -> kcp::Result<KcpCore> {
         extern "C" fn kcp_output_cb_impl(
             data: *const u8,
             len: i32,
@@ -332,8 +340,9 @@ impl KcpManager {
             manager: self.clone(),
         };
 
-        let kcp = kcp::Kcp::new_fast(
+        let kcp = kcp::Kcp::new(
             RemoteConv(conv),
+            kcp_config,
             Some((Box::into_raw(Box::new(output)), Self::kcp_cleanup)),
         )?;
 

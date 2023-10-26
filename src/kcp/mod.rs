@@ -63,6 +63,8 @@ pub trait ConvAllocator: Send {
     fn deallocate(&mut self, conv: ikcp::CONV_T);
 }
 
+const IKCP_WND_RCV: usize = 128;
+
 unsafe impl<A> Send for Kcp<A> where A: ConvAllocator {}
 unsafe impl<A> Sync for Kcp<A> where A: ConvAllocator {}
 
@@ -140,18 +142,38 @@ where
 
     pub fn recv(&self, buf: &mut [u8]) -> error::Result<usize> {
         let retval = unsafe { ikcp::recv(self.ikcp, buf.as_mut_ptr(), buf.len() as i32) };
-        Ok(retval as usize)
+
+        if retval == -3 {
+            Err(error::KcpErrorKind::BufferTooSmall(buf.len(), self.peeksize() as usize).into())
+        } else {
+            Ok(retval as usize)
+        }
     }
 
     pub fn send<D>(&self, pkt: D) -> error::Result<usize>
     where
         D: AsRef<[u8]>,
     {
-        let data = pkt.as_ref();
+        let mut data = pkt.as_ref();
+        let mss = self.get_mss() as usize;
+
+        if data.len() > mss {
+            let count = (data.len() + mss - 1) / mss;
+            if count >= IKCP_WND_RCV {
+                let size = data.len() - (mss * (count - IKCP_WND_RCV)) - mss;
+                data = &data[..size]
+            }
+        }
 
         let retval = unsafe { ikcp::send(self.ikcp, data.as_ptr(), data.len() as i32) };
 
-        Ok(retval as usize)
+        if retval < 0 {
+            return Err(error::KcpError::WriteError(retval));
+        } else {
+            self.flush();
+
+            Ok(retval as usize)
+        }
     }
 
     pub fn flush(&self) {
@@ -170,6 +192,16 @@ where
             Err(KcpErrorKind::InputError(retval).into())
         } else {
             Ok(())
+        }
+    }
+
+    pub fn get_mss(&self) -> i32 {
+        unsafe { ikcp::get_mss(self.ikcp) }
+    }
+
+    pub fn set_minrto(&self, minrto: i32) {
+        unsafe {
+            ikcp::set_minrto(self.ikcp, minrto);
         }
     }
 

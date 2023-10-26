@@ -13,6 +13,7 @@ pub enum KcpError {
     NoMoreConv,
     ReadTimeout(u32),
     WriteTimeout(u32),
+    WriteError(i32),
     Closed,
     SignalReadClosed,
     SignalSendClosed,
@@ -23,7 +24,7 @@ pub enum KcpErrorKind {
     CreateFail,
     InputError(i32),
     InvalidConv(u32),
-    UserDataToSmall(u32),
+    BufferTooSmall(usize, usize),
     InvalidCommand(u32, u8),
     StdIoError(std::io::Error),
 }
@@ -59,6 +60,9 @@ impl From<KcpError> for io::Error {
             KcpError::SignalSendClosed => io::ErrorKind::BrokenPipe.into(),
             KcpError::ReadTimeout(_) => io::ErrorKind::TimedOut.into(),
             KcpError::NoMoreConv => io::Error::new(io::ErrorKind::AddrInUse, "conv exhausted"),
+            KcpError::WriteError(val) => {
+                io::Error::new(io::ErrorKind::Other, format!("write({})", val))
+            }
         }
     }
 }
@@ -71,8 +75,8 @@ impl From<KcpErrorKind> for io::Error {
             KcpErrorKind::InvalidConv(_) => {
                 io::Error::new(io::ErrorKind::InvalidData, "invalid conv")
             }
-            KcpErrorKind::UserDataToSmall(_) => {
-                io::Error::new(io::ErrorKind::Other, "buffer too small")
+            KcpErrorKind::BufferTooSmall(size, need) => {
+                io::Error::new(io::ErrorKind::Other, format!("buffer too small: {} {}", size, need))
             }
             KcpErrorKind::InvalidCommand(_, _) => {
                 io::Error::new(io::ErrorKind::InvalidData, "invalid header")

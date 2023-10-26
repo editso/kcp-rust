@@ -217,7 +217,7 @@ impl<A: ConvAllocator> SafeKcp<A> {
         let retval = {
             let mut this = self.0.lock().unwrap();
             match this.inner.input(pkt) {
-                Ok(_) => {
+                Ok(()) => {
                     this.clsck_inc = 0;
                     this.last_update = 0;
                     this.last_send = now_mills();
@@ -245,9 +245,10 @@ impl<A: ConvAllocator> SafeKcp<A> {
         }
 
         let mut this = self.0.lock().unwrap();
+
         if this.send_closed {
             Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()))
-        } else if this.inner.waitsnd() >= (this.inner.sndwnd_size() / 2) as u32 {
+        } else if this.inner.waitsnd() >= this.inner.sndwnd_size() as u32 {
             this.send_waker = Some(cx.waker().clone());
             Poll::Pending
         } else {

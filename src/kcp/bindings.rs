@@ -57,5 +57,11 @@ pub mod ikcp {
 
         #[link_name = "ikcp_getconv"]
         pub(crate) fn getconv(ptr: *const c_void) -> CONV_T;
+
+        #[link_name = "ikcp_get_mss"]
+        pub(crate) fn get_mss(kcp: CB) -> i32;
+        
+        #[link_name = "ikcp_set_minrto"]
+        pub(crate) fn set_minrto(kcp: CB, minrto: i32);
     }
 }

@@ -78,25 +78,34 @@ impl Runner for WithTokioRuntime {
     type Err = std::io::Error;
 
     fn start(background: Background) -> std::result::Result<(), Self::Err> {
-        let f = || {
-            let kind = background.kind();
-            let mut runtime = tokio::runtime::Builder::new_current_thread();
-            if kind == TaskKind::Closer {
-                &mut runtime
-            } else {
-                runtime.event_interval(2).global_queue_interval(2)
-            }
-            .enable_all()
-            .build()
-            .unwrap()
-            .block_on(background)
-        };
-
         #[cfg(feature = "multi_thread")]
-        std::thread::spawn(f);
+        std::thread::spawn(|| {
+            || {
+                let kind = background.kind();
+                let mut runtime = tokio::runtime::Builder::new_current_thread();
+                if kind == TaskKind::Closer {
+                    &mut runtime
+                } else {
+                    runtime.event_interval(2).global_queue_interval(2)
+                }
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(background)
+            }
+        });
 
         #[cfg(not(feature = "multi_thread"))]
-        f()?;
+        tokio::spawn(async move {
+            match background.await {
+                Ok(_) => {
+                    log::info!("kcp[background] finished")
+                }
+                Err(e) => {
+                    log::warn!("kcp[background] error: {:?}", e)
+                }
+            }
+        });
 
         Ok(())
     }
@@ -173,5 +182,50 @@ impl server::KcpListener<TokioUdpSocket> {
         config: Config,
     ) -> std::result::Result<Self, std::io::Error> {
         server::KcpListener::new::<WithTokioRuntime>(TokioUdpSocket(Arc::new(io)), config)
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use std::time::Duration;
+
+    use crate::{KcpConnector, KcpListener};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[test]
+    fn test() {
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async move {
+                tokio::spawn(async move {
+                    let udp = tokio::net::UdpSocket::bind("127.0.0.1:9999").await.unwrap();
+
+                    let kcp_listener =
+                        KcpListener::new_with_tokio(udp, Default::default()).unwrap();
+
+                    let (conv, addr, mut kcp_stream) = kcp_listener.accept().await.unwrap();
+
+                    let mut s = [0u8; 1024];
+
+                    println!("connected {conv} {addr}");
+
+                    let n = kcp_stream.read(&mut s).await.unwrap();
+
+                    println!("message: {}", String::from_utf8(s[..n].to_vec()).unwrap())
+                });
+
+                let udp = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+                udp.connect("127.0.0.1:9999").await.unwrap();
+
+                let mut kcp_connector =
+                    KcpConnector::new_with_tokio(udp, Default::default()).unwrap();
+                let (_, mut kcp_stream) = kcp_connector.open().await.unwrap();
+
+                kcp_stream.write(b"hello world").await.unwrap();
+
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            })
     }
 }

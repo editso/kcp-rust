@@ -7,14 +7,26 @@ mod queue;
 mod server;
 mod signal;
 
+#[cfg(feature = "runtime_smol")]
+mod smol;
+
+#[cfg(feature = "runtime_tokio")]
+mod tokio;
+
 use std::{future::Future, pin::Pin};
 
 pub use kcp::KcpConfig;
 pub use poller::Timer;
 pub use r#async::*;
 
-pub use kcp::{FAST_MODE, NORMAL_MODE};
+#[cfg(feature = "runtime_smol")]
+pub use smol::*;
+
+#[cfg(feature = "runtime_tokio")]
+pub use tokio::*;
+
 pub use client::{ClientImpl, KcpConnector};
+pub use kcp::{FAST_MODE, NORMAL_MODE};
 pub use server::{KcpListener, ServerImpl};
 
 macro_rules! background {
@@ -143,294 +155,13 @@ impl Default for Config {
 }
 
 #[cfg(test)]
+#[cfg(feature = "runtime_smol")]
 mod tests {
-    use std::net::SocketAddr;
-    use std::pin::Pin;
+    use crate::{KcpConnector, KcpListener};
     use std::sync::Arc;
     use std::thread;
 
-    use smol::future::FutureExt;
-    use smol::io;
-
-    use crate::r#async::{AsyncRecv, AsyncRecvfrom, AsyncSend, AsyncSendTo};
-    use crate::{client::KcpConnector, server::KcpListener};
-    use crate::{kcp, poller, Background, KcpStream};
-
-    #[derive(Clone)]
-    pub struct UdpSocket {
-        inner: smol::net::UdpSocket,
-        reader_fut: Arc<std::sync::Mutex<Option<poller::BoxedFuture<io::Result<Vec<u8>>>>>>,
-        writer_fut: Arc<std::sync::Mutex<Option<poller::BoxedFuture<io::Result<usize>>>>>,
-        sendto_fut: Arc<std::sync::Mutex<Option<poller::BoxedFuture<io::Result<usize>>>>>,
-        recvfrom_fut:
-            Arc<std::sync::Mutex<Option<poller::BoxedFuture<io::Result<(SocketAddr, Vec<u8>)>>>>>,
-    }
-
-    impl UdpSocket {
-        pub fn new(udp: smol::net::UdpSocket) -> Self {
-            Self {
-                inner: udp,
-                reader_fut: Default::default(),
-                writer_fut: Default::default(),
-                recvfrom_fut: Default::default(),
-                sendto_fut: Default::default(),
-            }
-        }
-    }
-
-    impl AsyncSend for UdpSocket {
-        fn poll_send(
-            self: Pin<&mut Self>,
-            cx: &mut std::task::Context<'_>,
-            buf: &[u8],
-        ) -> std::task::Poll<std::io::Result<usize>> {
-            // let a = self.send(buf);
-
-            let mut this = self.writer_fut.lock().unwrap();
-
-            let mut fut = this.take().unwrap_or_else(|| {
-                let udp = self.inner.clone();
-                let mut buf = buf.to_vec();
-                Box::pin(async move {
-                    let n = udp.send(&mut buf).await?;
-                    std::io::Result::Ok(n)
-                })
-            });
-
-            match Pin::new(&mut fut).poll(cx) {
-                std::task::Poll::Ready(Err(e)) => std::task::Poll::Ready(Err(e)),
-                std::task::Poll::Pending => {
-                    *this = Some(fut);
-                    std::task::Poll::Pending
-                }
-                std::task::Poll::Ready(Ok(n)) => std::task::Poll::Ready(Ok(n)),
-            }
-        }
-    }
-
-    impl AsyncRecv for UdpSocket {
-        fn poll_recv(
-            self: Pin<&mut Self>,
-            cx: &mut std::task::Context<'_>,
-            buf: &mut [u8],
-        ) -> std::task::Poll<std::io::Result<usize>> {
-            let mut this = self.reader_fut.lock().unwrap();
-
-            let mut fut = this.take().unwrap_or_else(|| {
-                let udp = self.inner.clone();
-                let mut buf = unsafe {
-                    let mut tmp = Vec::with_capacity(buf.len());
-                    tmp.set_len(buf.len());
-                    tmp
-                };
-                Box::pin(async move {
-                    let n = udp.recv(&mut buf).await?;
-                    buf.truncate(n);
-                    std::io::Result::Ok(buf)
-                })
-            });
-
-            match Pin::new(&mut fut).poll(cx) {
-                std::task::Poll::Ready(Err(e)) => std::task::Poll::Ready(Err(e)),
-                std::task::Poll::Pending => {
-                    *this = Some(fut);
-                    std::task::Poll::Pending
-                }
-                std::task::Poll::Ready(Ok(data)) => {
-                    buf[..data.len()].copy_from_slice(&data);
-                    std::task::Poll::Ready(Ok(data.len()))
-                }
-            }
-        }
-    }
-
-    impl AsyncSendTo for UdpSocket {
-        fn poll_sendto(
-            &mut self,
-            cx: &mut std::task::Context<'_>,
-            addr: &SocketAddr,
-            buf: &[u8],
-        ) -> std::task::Poll<std::io::Result<usize>> {
-            // let a = self.send(buf);
-
-            let mut this = self.sendto_fut.lock().unwrap();
-
-            let mut fut = this.take().unwrap_or_else(|| {
-                let udp = self.inner.clone();
-                let mut buf = buf.to_vec();
-                let addr = *addr;
-                Box::pin(async move {
-                    let n = udp.send_to(&mut buf, addr).await?;
-                    std::io::Result::Ok(n)
-                })
-            });
-
-            match Pin::new(&mut fut).poll(cx) {
-                std::task::Poll::Ready(Err(e)) => std::task::Poll::Ready(Err(e)),
-                std::task::Poll::Pending => {
-                    *this = Some(fut);
-                    std::task::Poll::Pending
-                }
-                std::task::Poll::Ready(Ok(n)) => std::task::Poll::Ready(Ok(n)),
-            }
-        }
-    }
-
-    impl AsyncRecvfrom for UdpSocket {
-        fn poll_recvfrom(
-            &mut self,
-            cx: &mut std::task::Context<'_>,
-            buf: &mut [u8],
-        ) -> std::task::Poll<std::io::Result<(std::net::SocketAddr, usize)>> {
-            let mut this = self.recvfrom_fut.lock().unwrap();
-
-            let mut fut = this.take().unwrap_or_else(|| {
-                let udp = self.inner.clone();
-                let mut buf = unsafe {
-                    let mut tmp = Vec::with_capacity(buf.len());
-                    tmp.set_len(buf.len());
-                    tmp
-                };
-                Box::pin(async move {
-                    let (n, addr) = udp.recv_from(&mut buf).await?;
-
-                    buf.truncate(n);
-
-                    std::io::Result::Ok((addr, buf))
-                })
-            });
-
-            match Pin::new(&mut fut).poll(cx) {
-                std::task::Poll::Ready(Err(e)) => std::task::Poll::Ready(Err(e)),
-                std::task::Poll::Pending => {
-                    *this = Some(fut);
-                    std::task::Poll::Pending
-                }
-                std::task::Poll::Ready(Ok((addr, data))) => {
-                    buf[..data.len()].copy_from_slice(&data);
-                    std::task::Poll::Ready(Ok((addr, data.len())))
-                }
-            }
-        }
-    }
-
-    struct KcpClientRuntime;
-
-    struct KcpRunner;
-
-    struct KcpTimer;
-
-    impl poller::Timer for KcpTimer {
-        type Ret = std::time::Instant;
-        type Output = smol::Timer;
-
-        fn sleep(&self, time: std::time::Duration) -> Self::Output {
-            smol::Timer::after(time)
-        }
-    }
-
-    impl crate::Runner for KcpRunner {
-        type Err = io::Error;
-        fn start(process: Background) -> std::result::Result<(), Self::Err> {
-            std::thread::Builder::new()
-                .name("processor[kcp]".into())
-                .spawn(move || {
-                    smol::block_on(async move {
-                        if let Err(e) = process.await {
-                            log::debug!("error {:?}", e);
-                        };
-                    });
-
-                    log::debug!("exit thread ...");
-                })
-                .unwrap();
-
-            Ok(())
-        }
-    }
-
-    impl smol::io::AsyncRead for KcpStream<crate::client::ClientImpl> {
-        fn poll_read(
-            self: Pin<&mut Self>,
-            cx: &mut std::task::Context<'_>,
-            buf: &mut [u8],
-        ) -> std::task::Poll<io::Result<usize>> {
-            match crate::AsyncRead::poll_read(self, cx, buf)? {
-                std::task::Poll::Pending => std::task::Poll::Pending,
-                std::task::Poll::Ready(n) => std::task::Poll::Ready(Ok(n)),
-            }
-        }
-    }
-
-    impl smol::io::AsyncWrite for KcpStream<crate::client::ClientImpl> {
-        fn poll_write(
-            self: Pin<&mut Self>,
-            cx: &mut std::task::Context<'_>,
-            buf: &[u8],
-        ) -> std::task::Poll<io::Result<usize>> {
-            crate::AsyncWrite::poll_write(self, cx, buf)
-        }
-
-        fn poll_close(
-            self: Pin<&mut Self>,
-            cx: &mut std::task::Context<'_>,
-        ) -> std::task::Poll<io::Result<()>> {
-            crate::AsyncWrite::poll_close(self, cx)
-        }
-
-        fn poll_flush(
-            self: Pin<&mut Self>,
-            cx: &mut std::task::Context<'_>,
-        ) -> std::task::Poll<io::Result<()>> {
-            crate::AsyncWrite::poll_flush(self, cx)
-        }
-    }
-
-    impl smol::io::AsyncRead for KcpStream<crate::server::ServerImpl> {
-        fn poll_read(
-            self: Pin<&mut Self>,
-            cx: &mut std::task::Context<'_>,
-            buf: &mut [u8],
-        ) -> std::task::Poll<io::Result<usize>> {
-            crate::AsyncRead::poll_read(self, cx, buf)
-        }
-    }
-
-    impl smol::io::AsyncWrite for KcpStream<crate::server::ServerImpl> {
-        fn poll_write(
-            self: Pin<&mut Self>,
-            cx: &mut std::task::Context<'_>,
-            buf: &[u8],
-        ) -> std::task::Poll<io::Result<usize>> {
-            crate::AsyncWrite::poll_write(self, cx, buf)
-        }
-
-        fn poll_close(
-            self: Pin<&mut Self>,
-            cx: &mut std::task::Context<'_>,
-        ) -> std::task::Poll<io::Result<()>> {
-            crate::AsyncWrite::poll_close(self, cx)
-        }
-
-        fn poll_flush(
-            self: Pin<&mut Self>,
-            cx: &mut std::task::Context<'_>,
-        ) -> std::task::Poll<io::Result<()>> {
-            crate::AsyncWrite::poll_flush(self, cx)
-        }
-    }
-
-    impl crate::KcpRuntime for KcpClientRuntime {
-        type Err = io::Error;
-
-        type Runner = KcpRunner;
-
-        type Timer = KcpTimer;
-
-        fn timer() -> Self::Timer {
-            KcpTimer
-        }
-    }
+    use super::kcp;
 
     #[test]
     fn overflow_test() {
@@ -459,8 +190,7 @@ mod tests {
             udp.connect("127.0.0.1:9999").await?;
 
             let tcp_server = smol::net::TcpListener::bind("0.0.0.0:7777").await.unwrap();
-            let mut kcp_connector =
-                KcpConnector::new::<KcpClientRuntime>(UdpSocket::new(udp), Default::default())?;
+            let mut kcp_connector = KcpConnector::new_with_smol(udp, Default::default()).unwrap();
 
             loop {
                 let (stream, _) = tcp_server.accept().await.unwrap();
@@ -503,8 +233,7 @@ mod tests {
         smol::block_on(async {
             let udp = smol::net::UdpSocket::bind("127.0.0.1:9999").await.unwrap();
 
-            let udp = UdpSocket::new(udp);
-            let kcp_server = KcpListener::new::<KcpClientRuntime>(udp, Default::default()).unwrap();
+            let kcp_server = KcpListener::new_with_smol(udp, Default::default()).unwrap();
 
             loop {
                 let (_, _, stream) = kcp_server.accept().await.unwrap();

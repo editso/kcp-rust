@@ -44,7 +44,7 @@ async fn main(){
 
             kcp_stream.write(b"hello world").await.unwrap();
 
-            tokio::time::sleep(Duration::from_secs(2)).await;
+            kcp_stream.shutdown().await.unwrap();
         })
 }
 ```

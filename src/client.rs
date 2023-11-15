@@ -28,15 +28,14 @@ struct ManagerImpl {
     poller: poller::KcpPoller<KcpConv>,
     kcp_closer: WriteHalf<u32>,
     kcp_read_sig: Arc<SigWrite<KcpReadSig>>,
-    kcp_update_sig: SigWrite<KcpUpdateSig>,
-    sessions: HashMap<u32, KcpCore>,
+    kcp_update_sig: Arc<SigWrite<KcpUpdateSig>>,
+    sessions: Arc<Mutex<HashMap<u32, KcpCore>>>,
 }
 
 #[derive(Clone)]
 struct KcpCore(SafeKcp<KcpConv>);
 
-#[derive(Clone)]
-struct KcpManager(Arc<Mutex<ManagerImpl>>);
+struct KcpManager(ManagerImpl);
 
 pub struct KcpConnector<IO: Clone> {
     config: Config,
@@ -75,14 +74,14 @@ where
         let kcp_closer = Queue::new(255).split();
         let kcp_read_sig_0 = Arc::new(kcp_read_signal.0);
 
-        let manager = KcpManager(Arc::new(Mutex::new(ManagerImpl {
+        let manager = KcpManager(ManagerImpl {
             poller: poller.clone(),
             snd_que: snd_que.0,
             kcp_closer: kcp_closer.0,
             kcp_read_sig: kcp_read_sig_0.clone(),
-            kcp_update_sig: kcp_update_signal.0,
+            kcp_update_sig: Arc::new(kcp_update_signal.0),
             sessions: Default::default(),
-        })));
+        });
 
         config.rcvbuf_size = if config.rcvbuf_size < config.kcp_config.mtu as usize {
             config.kcp_config.mtu as usize
@@ -91,7 +90,6 @@ where
         };
 
         let processors = vec![
-            Background::new_poller(poller::run_async_update(kcp_update_signal.1, poller_fut)),
             Background::new_sender(Self::run_async_write(kcp_read_sig_0, snd_que.1, io.clone())),
             Background::new_closer(Self::run_async_close(kcp_closer.1, manager.clone())),
             Background::new_reader(Self::run_async_read(
@@ -99,6 +97,11 @@ where
                 config,
                 kcp_read_signal.1,
                 manager.clone(),
+            )),
+            Background::new_poller(poller::run_async_update(
+                poller.clone(),
+                kcp_update_signal.1,
+                poller_fut,
             )),
         ];
 
@@ -179,9 +182,8 @@ where
     }
 
     pub async fn close(&self) {
-        let this = self.manager.0.lock().unwrap();
-        drop(this.kcp_read_sig.send(KcpReadSig::Quit).await);
-        drop(this.kcp_update_sig.send(KcpUpdateSig::Stop).await);
+        drop(self.manager.kcp_read_sig.send(KcpReadSig::Quit).await);
+        drop(self.manager.kcp_update_sig.send(KcpUpdateSig::Stop).await);
     }
 }
 
@@ -319,11 +321,11 @@ where
 impl ConvAllocator for KcpConv {
     fn allocate(&mut self) -> kcp::Result<kcp::CONV_T> {
         let mut conv = self.conv.lock().unwrap();
-        let manager = self.manager.0.lock().unwrap();
+        let sessions = self.manager.sessions.lock().unwrap();
 
         let last_conv = *conv;
 
-        while manager.sessions.contains_key(&conv) {
+        while sessions.contains_key(&conv) {
             let (nex_conv, overflow) = conv.overflowing_add(1);
             *conv = if overflow { 1 } else { nex_conv };
             if *conv == last_conv {
@@ -371,14 +373,25 @@ impl AsyncRead for ClientImpl {
     }
 }
 
+impl std::ops::Deref for KcpManager {
+    type Target = ManagerImpl;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for KcpManager {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
 impl KcpManager {
     async fn manage(&self, conv: u32, kcp: KcpCore) -> kcp::Result<()> {
-        let mut this = self.0.lock().unwrap();
+        self.sessions.lock().unwrap().insert(conv, kcp);
 
-        this.sessions.insert(conv, kcp);
-
-        this.kcp_read_sig.send(KcpReadSig::Resume).await?;
-        this.kcp_update_sig.send(KcpUpdateSig::Resume).await?;
+        self.kcp_read_sig.send(KcpReadSig::Resume).await?;
+        self.kcp_update_sig.send(KcpUpdateSig::Resume).await?;
 
         Ok(())
     }
@@ -386,39 +399,37 @@ impl KcpManager {
 
 impl KcpManager {
     fn output(&self, data: &[u8]) -> i32 {
-        let this = self.0.lock().unwrap();
-
-        if let Err(e) = this.snd_que.block_send(data.to_vec()) {
+        if let Err(e) = self.snd_que.block_send(data.to_vec()) {
             log::error!("{}", e);
-            this.kcp_read_sig.close();
-            this.kcp_update_sig.close();
+            self.kcp_read_sig.close();
+            self.kcp_update_sig.close();
         }
 
         data.len() as i32
     }
 
     fn remove_kcp(&self, conv: u32) {
-        if let Some(kcp) = self.0.lock().unwrap().sessions.remove(&conv) {
+        if let Some(kcp) = self.sessions.lock().unwrap().remove(&conv) {
             kcp.0.force_close()
         }
     }
 
     fn lookup(&self, conv: u32) -> Option<KcpCore> {
-        self.0.lock().unwrap().sessions.get(&conv).map(Clone::clone)
+        self.sessions.lock().unwrap().get(&conv).map(Clone::clone)
     }
 
     fn close_kcp(&self, conv: u32) {
-        if let Err(e) = self.0.lock().unwrap().kcp_closer.block_send(conv) {
+        if let Err(e) = self.kcp_closer.block_send(conv) {
             log::error!("{:?}", e);
         };
     }
 
     fn close_all_session(&self) {
-        let this = self.0.lock().unwrap();
+        let sessions = self.sessions.lock().unwrap();
 
-        let count = this.sessions.len();
+        let count = sessions.len();
 
-        for (_, kcp) in this.sessions.iter() {
+        for (_, kcp) in sessions.iter() {
             kcp.0.force_close();
         }
 
@@ -426,11 +437,10 @@ impl KcpManager {
     }
 
     fn stop_all_processor(&self) {
-        let this = self.0.lock().unwrap();
-        this.poller.stop();
-        this.kcp_closer.close();
-        this.kcp_read_sig.close();
-        this.kcp_update_sig.close();
+        self.poller.stop();
+        self.kcp_closer.close();
+        self.kcp_read_sig.close();
+        self.kcp_update_sig.close();
     }
 }
 
@@ -440,6 +450,19 @@ impl Clone for KcpConv {
             conv: self.conv.clone(),
             manager: self.manager.clone(),
         }
+    }
+}
+
+impl Clone for KcpManager {
+    fn clone(&self) -> Self {
+        KcpManager(ManagerImpl {
+            snd_que: self.snd_que.clone(),
+            poller: self.poller.clone(),
+            kcp_closer: self.kcp_closer.clone(),
+            kcp_read_sig: self.kcp_read_sig.clone(),
+            kcp_update_sig: self.kcp_update_sig.clone(),
+            sessions: self.sessions.clone(),
+        })
     }
 }
 

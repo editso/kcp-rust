@@ -65,7 +65,7 @@ unsafe impl<IO> Send for KcpListener<IO> {}
 
 impl<IO> KcpListener<IO>
 where
-    IO: AsyncRecvfrom + AsyncSendTo + Send + Unpin + Clone + 'static,
+    IO: AsyncRecvfrom + AsyncSendTo + Send + Unpin + Clone + 'static
 {
     pub fn new<R>(io: IO, config: Config) -> std::result::Result<Self, R::Err>
     where
@@ -73,14 +73,14 @@ where
     {
         let mut config = config;
         let sessions = HashMap::new();
-        let (kcp_poller, poller_fut) = KcpPoller::new(R::timer());
+        let (poller, poller_fut) = KcpPoller::new(R::timer());
         let acceptor = Queue::new(10).split();
         let kcp_closer = Queue::new(255).split();
         let kcp_update_sig = signal(255);
         let kcp_sender = Queue::new(config.quebuf_size).split();
 
         let kcp_manager = KcpManager {
-            poller: kcp_poller.clone(),
+            poller: poller.clone(),
             kcp_closer: Arc::new(kcp_closer.0),
             poller_sig: Arc::new(kcp_update_sig.0),
             inner: Arc::new(Mutex::new(ManagerImpl { sessions })),
@@ -94,7 +94,7 @@ where
         };
 
         let processors = vec![
-            Background::new_poller(poller::run_async_update(kcp_update_sig.1, poller_fut)),
+            Background::new_poller(poller::run_async_update(poller, kcp_update_sig.1, poller_fut)),
             Background::new_sender(Self::kcp_async_send(io.clone(), kcp_sender.1)),
             Background::new_closer(Self::kcp_async_close(kcp_closer.1, kcp_manager.clone())),
             Background::new_reader(Self::kcp_async_recv(

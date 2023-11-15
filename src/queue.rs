@@ -252,6 +252,12 @@ impl<T: Unpin> Drop for WriteHalf<T> {
     }
 }
 
+impl<T: Unpin + Clone> Clone for WriteHalf<T>{
+    fn clone(&self) -> Self {
+        WriteHalf(self.0.clone())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{sync::Arc, time::Duration};

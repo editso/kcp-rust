@@ -4,7 +4,7 @@ use tokio::io::ReadBuf;
 
 use crate::{
     client, server, AsyncRead, AsyncRecv, AsyncRecvfrom, AsyncSend, AsyncSendTo, AsyncWrite,
-    Background, Config, KcpRuntime, KcpStream, Runner, TaskKind, Timer,
+    Background, Config, KcpRuntime, KcpStream, Runner, Timer,
 };
 
 #[derive(Clone)]
@@ -78,6 +78,7 @@ impl Runner for WithTokioRuntime {
     type Err = std::io::Error;
 
     fn start(background: Background) -> std::result::Result<(), Self::Err> {
+        let kind = background.kind();
         #[cfg(feature = "multi_thread")]
         std::thread::spawn(|| {
             || {
@@ -102,7 +103,7 @@ impl Runner for WithTokioRuntime {
                     log::info!("kcp[background] finished")
                 }
                 Err(e) => {
-                    log::warn!("kcp[background] error: {:?}", e)
+                    log::warn!("error({:?}), stop {:?}", e, kind)
                 }
             }
         });
@@ -193,39 +194,81 @@ mod test {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[test]
-    fn test() {
+    fn test_tokio_runtime() {
+        // env_logger::builder()
+        //     .filter_level(log::LevelFilter::Trace)
+        //     .init();
+
         tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
             .unwrap()
             .block_on(async move {
-                tokio::spawn(async move {
-                    let udp = tokio::net::UdpSocket::bind("127.0.0.1:9999").await.unwrap();
+                let server = tokio::net::UdpSocket::bind("127.0.0.1:9999").await;
 
-                    let kcp_listener =
-                        KcpListener::new_with_tokio(udp, Default::default()).unwrap();
+                assert!(server.is_ok());
 
-                    let (conv, addr, mut kcp_stream) = kcp_listener.accept().await.unwrap();
+                let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await;
+
+                assert!(client.is_ok());
+
+                let client_fut = async move {
+                    let client = client.unwrap();
+
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+
+                    assert!(client.connect("127.0.0.1:9999").await.is_ok());
+
+                    let result = KcpConnector::new_with_tokio(client, Default::default());
+
+                    assert!(result.is_ok());
+
+                    let mut kcp_connector = result.unwrap();
+
+                    let result = kcp_connector.open().await;
+
+                    assert!(result.is_ok());
+
+                    let (_, mut kcp_stream) = result.unwrap();
+
+                    assert!(kcp_stream.write(b"hello world").await.is_ok());
+
+                    assert!(kcp_stream.shutdown().await.is_ok());
+                };
+
+                let server_fut = async move {
+                    let server = server.unwrap();
+
+                    let result = KcpListener::new_with_tokio(server, Default::default());
+
+                    assert!(result.is_ok());
+
+                    let kcp_listener = result.unwrap();
+
+                    let result = kcp_listener.accept().await;
+
+                    assert!(result.is_ok());
+
+                    let (_, _, mut kcp_stream) = result.unwrap();
 
                     let mut s = [0u8; 1024];
 
-                    println!("connected {conv} {addr}");
+                    let result = kcp_stream.read(&mut s).await;
 
-                    let n = kcp_stream.read(&mut s).await.unwrap();
+                    assert!(result.is_ok());
 
-                    println!("message: {}", String::from_utf8(s[..n].to_vec()).unwrap())
-                });
+                    let n = result.unwrap();
 
-                let udp = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-                udp.connect("127.0.0.1:9999").await.unwrap();
+                    assert_eq!(n, 11);
 
-                let mut kcp_connector =
-                    KcpConnector::new_with_tokio(udp, Default::default()).unwrap();
-                let (_, mut kcp_stream) = kcp_connector.open().await.unwrap();
+                    String::from_utf8(s[..n].to_vec()).unwrap()
+                };
 
-                kcp_stream.write(b"hello world").await.unwrap();
+                let (s, _) = tokio::join!(server_fut, client_fut);
 
-                tokio::time::sleep(Duration::from_secs(2)).await;
+                assert_eq!(s, "hello world");
+
+                println!("message: {s}");
             })
     }
 }

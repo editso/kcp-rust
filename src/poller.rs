@@ -39,6 +39,11 @@ pub struct KcpImpl<A: ConvAllocator> {
 
 pub struct SafeKcp<A: ConvAllocator>(Arc<Mutex<KcpImpl<A>>>);
 
+enum GuardState {
+    Stop(BoxedFuture<kcp::Result<()>>),
+    Running(Pin<Box<dyn Future<Output = (BoxedFuture<kcp::Result<()>>, kcp::Result<()>)> + Send>>),
+}
+
 pub trait Timer {
     type Ret: Any;
     type Output: Future<Output = Self::Ret> + Send + Unpin + 'static;
@@ -46,6 +51,11 @@ pub trait Timer {
 }
 
 pub struct KcpPoller<A: ConvAllocator>(Arc<WriteHalf<SafeKcp<A>>>);
+
+pub struct GuardedUpdate<A: ConvAllocator> {
+    fut: GuardState,
+    poller: KcpPoller<A>,
+}
 
 pub fn now_mills() -> u32 {
     std::time::SystemTime::now()
@@ -328,7 +338,9 @@ where
         let poller = KcpPoller(Arc::new(rx));
         (poller, Box::pin(self::poller_main(timer, ax)))
     }
+}
 
+impl<A: ConvAllocator> KcpPoller<A> {
     pub fn stop(&self) {
         self.0.close();
     }
@@ -346,10 +358,12 @@ where
     let mut sessions: Vec<SafeKcp<A>> = Vec::new();
     let mut sleep_fut: Option<T::Output> = None;
 
-    loop {
+    let mut infallible = kcp::Result::Ok(());
+
+    while infallible.is_ok() {
         let mut recv_fut = ax.recv();
 
-        poll_fn(|cx| match Pin::new(&mut recv_fut).poll(cx)? {
+        infallible = poll_fn(|cx| match Pin::new(&mut recv_fut).poll(cx)? {
             Poll::Ready(kcp) => {
                 sessions.push(kcp);
                 Poll::Ready(kcp::Result::Ok(()))
@@ -373,14 +387,33 @@ where
                 },
             },
         })
-        .await?;
+        .await;
+    }
+
+    for session in sessions {
+        session.force_close();
+    }
+
+    infallible
+}
+
+pub fn run_async_update<A: ConvAllocator + 'static>(
+    poller: KcpPoller<A>,
+    signal: SigRead<KcpUpdateSig>,
+    poller_fut: BoxedFuture<kcp::Result<()>>,
+) -> GuardedUpdate<A> {
+    GuardedUpdate {
+        poller,
+        fut: GuardState::Running(Box::pin(self::run_async_update_internal::<A>(
+            signal, poller_fut,
+        ))),
     }
 }
 
-pub async fn run_async_update(
+pub async fn run_async_update_internal<A: ConvAllocator>(
     signal: SigRead<KcpUpdateSig>,
     poller_fut: BoxedFuture<kcp::Result<()>>,
-) -> kcp::Result<()> {
+) -> (BoxedFuture<kcp::Result<()>>, kcp::Result<()>) {
     let mut poller_fut = poller_fut;
     let mut pause_poller = true;
 
@@ -396,12 +429,12 @@ pub async fn run_async_update(
         match poll_signal_or(poller_fn, signal.recv()).await {
             Sig::Data(result) => {
                 log::trace!("poller finished");
-                break result;
+                break (poller_fut, result);
             }
             Sig::Signal(sig) => match sig {
                 Err(e) => {
                     log::debug!("kcp_update signal error {:?}", e);
-                    break Err(e);
+                    break (poller_fut, Err(e));
                 }
                 Ok(KcpUpdateSig::Pause) => {
                     pause_poller = true;
@@ -411,7 +444,7 @@ pub async fn run_async_update(
                 }
                 Ok(KcpUpdateSig::Stop) => {
                     log::debug!("stop kcp poller");
-                    break Ok(());
+                    break (poller_fut, Ok(()));
                 }
             },
         }
@@ -461,5 +494,41 @@ impl<A: ConvAllocator> Clone for SafeKcp<A> {
 impl<A: ConvAllocator> Clone for KcpPoller<A> {
     fn clone(&self) -> Self {
         KcpPoller(self.0.clone())
+    }
+}
+
+impl<A: ConvAllocator> Future for GuardedUpdate<A> {
+    type Output = kcp::Result<()>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
+        match &mut self.fut {
+            GuardState::Stop(fut) => Pin::new(fut).poll(cx),
+            GuardState::Running(fut) => match Pin::new(fut).poll(cx) {
+                Poll::Pending => Poll::Pending,
+                Poll::Ready((mut fut, result)) => {
+                    self.poller.stop();
+                    match Pin::new(&mut fut).poll(cx) {
+                        Poll::Pending => {
+                            drop(std::mem::replace(&mut self.fut, GuardState::Stop(fut)));
+                            Poll::Pending
+                        }
+                        Poll::Ready(r) => {
+                            if result.is_err() {
+                                Poll::Ready(result)
+                            } else {
+                                Poll::Ready(r)
+                            }
+                        }
+                    }
+                }
+            },
+        }
+    }
+}
+
+impl<A: ConvAllocator> Drop for GuardedUpdate<A> {
+    fn drop(&mut self) {
+        self.poller.stop();
+        // TODO wake all future
     }
 }

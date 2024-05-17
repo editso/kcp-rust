@@ -25,6 +25,8 @@ pub use smol::*;
 #[cfg(feature = "runtime_tokio")]
 pub use tokio::*;
 
+pub use kcp::KcpError;
+
 pub use client::{ClientImpl, KcpConnector};
 pub use kcp::{FAST_MODE, NORMAL_MODE};
 pub use server::{KcpListener, ServerImpl};

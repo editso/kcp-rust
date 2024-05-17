@@ -127,7 +127,7 @@ where
         })
     }
 
-    pub async fn open(&mut self) -> kcp::Result<(u32, KcpStream<ClientImpl>)> {
+    pub async fn open(&self) -> kcp::Result<(u32, KcpStream<ClientImpl>)> {
         extern "C" fn kcp_output_cb_impl(
             data: *const u8,
             len: i32,

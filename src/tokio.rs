@@ -3,8 +3,8 @@ use std::{future::Future, pin::Pin, sync::Arc};
 use tokio::io::ReadBuf;
 
 use crate::{
-    client, server, AsyncRead, AsyncRecv, AsyncRecvfrom, AsyncSend, AsyncSendTo, AsyncWrite,
-    Background, Config, KcpRuntime, KcpStream, Runner, Timer,
+    client, server, signal, AsyncRead, AsyncRecv, AsyncRecvfrom, AsyncSend, AsyncSendTo,
+    AsyncWrite, Background, Canceler, Config, KcpRuntime, KcpStream, Runner, Timer,
 };
 
 #[derive(Clone)]
@@ -77,14 +77,15 @@ impl KcpRuntime for WithTokioRuntime {
 impl Runner for WithTokioRuntime {
     type Err = std::io::Error;
 
-    fn start(background: Background) -> std::result::Result<(), Self::Err> {
-        let kind = background.kind();
+    fn start(background: Background) -> std::result::Result<Canceler, Self::Err> {
+        let (sender, reader) = signal::signal(1);
+
         #[cfg(feature = "multi_thread")]
         std::thread::spawn(|| {
             || {
                 let kind = background.kind();
                 let mut runtime = tokio::runtime::Builder::new_current_thread();
-                if kind == TaskKind::Closer {
+                if kind == crate::TaskKind::Closer {
                     &mut runtime
                 } else {
                     runtime.event_interval(2).global_queue_interval(2)
@@ -92,23 +93,33 @@ impl Runner for WithTokioRuntime {
                 .enable_all()
                 .build()
                 .unwrap()
-                .block_on(background)
+                .block_on(async move {
+                    tokio::select! {
+                        _ = background => {
+                            log::info!("kcp[background] finished")
+                        }
+                        _ = reader.recv() => {
+                            log::warn!("stop {:?}", kind)
+                        }
+                    };
+                })
             }
         });
 
         #[cfg(not(feature = "multi_thread"))]
         tokio::spawn(async move {
-            match background.await {
-                Ok(_) => {
+            let kind = background.kind();
+            tokio::select! {
+                _ = background => {
                     log::info!("kcp[background] finished")
                 }
-                Err(e) => {
-                    log::warn!("error({:?}), stop {:?}", e, kind)
+                _ = reader.recv() => {
+                    log::warn!("stop {:?}", kind)
                 }
-            }
+            };
         });
 
-        Ok(())
+        Ok(Canceler(sender))
     }
 }
 
@@ -223,7 +234,7 @@ mod test {
 
                     assert!(result.is_ok());
 
-                    let mut kcp_connector = result.unwrap();
+                    let kcp_connector = result.unwrap();
 
                     let result = kcp_connector.open().await;
 

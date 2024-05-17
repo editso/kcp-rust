@@ -12,7 +12,7 @@ use crate::poller::{self, KcpPoller, SafeKcp};
 use crate::queue::{Queue, ReadHalf, WriteHalf};
 use crate::r#async::{poll_fn, AsyncRead, AsyncRecv, AsyncSend, AsyncWrite};
 use crate::signal::{KcpReadSig, KcpUpdateSig, SigWrite};
-use crate::{kcp, signal, Background, Config, KcpRuntime, Runner};
+use crate::{kcp, signal, Background, Canceler, Config, KcpRuntime, Runner};
 use std::sync::Mutex;
 use std::task::Poll;
 
@@ -38,6 +38,7 @@ struct KcpCore(SafeKcp<KcpConv>);
 struct KcpManager(ManagerImpl);
 
 pub struct KcpConnector<IO: Clone> {
+    tasks: Vec<Canceler>,
     config: Config,
     allocate: KcpConv,
     manager: KcpManager,
@@ -105,9 +106,11 @@ where
             )),
         ];
 
+        let mut tasks = vec![];
+
         for process in processors {
             let kind = process.kind();
-            Runtime::Runner::start(process)?;
+            tasks.push(Runtime::Runner::start(process)?);
             log::trace!("kcp {:?} started", kind)
         }
 
@@ -119,9 +122,10 @@ where
         log::debug!("config: {:#?}", config);
 
         Ok(KcpConnector {
-            manager,
+            tasks,
             poller,
             config,
+            manager,
             allocate: conv_allocate,
             _marked: PhantomData,
         })
@@ -479,5 +483,9 @@ where
     fn drop(&mut self) {
         self.manager.close_all_session();
         self.manager.stop_all_processor();
+
+        for mut canceler in std::mem::replace(&mut self.tasks, Default::default()) {
+            canceler.cancel();
+        }
     }
 }

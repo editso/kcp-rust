@@ -10,7 +10,7 @@ use std::task::Poll;
 use std::{collections::HashMap, pin::Pin, sync::Arc};
 
 use crate::signal::KcpUpdateSig;
-use crate::{poller, Background, Config, KcpConfig, Runner};
+use crate::{poller, Background, Canceler, Config, KcpConfig, Runner};
 
 use crate::{
     kcp::{self, ConvAllocator},
@@ -31,12 +31,13 @@ struct ManagerImpl {
 struct KcpManager {
     inner: Arc<Mutex<ManagerImpl>>,
     poller: KcpPoller<RemoteConv>,
-    poller_sig: Arc<SigWrite<KcpUpdateSig>>,
     kcp_closer: Arc<WriteHalf<(u64, u32)>>,
+    poller_sig: Arc<SigWrite<KcpUpdateSig>>,
     kcp_sender: Arc<WriteHalf<(SocketAddr, Vec<u8>)>>,
 }
 
 pub struct KcpListener<IO> {
+    tasks: Vec<Canceler>,
     manager: KcpManager,
     kcp_receiver: ReadHalf<(u32, SocketAddr, KcpStream<ServerImpl>)>,
     _marked: PhantomData<IO>,
@@ -65,7 +66,7 @@ unsafe impl<IO> Send for KcpListener<IO> {}
 
 impl<IO> KcpListener<IO>
 where
-    IO: AsyncRecvfrom + AsyncSendTo + Send + Unpin + Clone + 'static
+    IO: AsyncRecvfrom + AsyncSendTo + Send + Unpin + Clone + 'static,
 {
     pub fn new<R>(io: IO, config: Config) -> std::result::Result<Self, R::Err>
     where
@@ -94,7 +95,11 @@ where
         };
 
         let processors = vec![
-            Background::new_poller(poller::run_async_update(poller, kcp_update_sig.1, poller_fut)),
+            Background::new_poller(poller::run_async_update(
+                poller,
+                kcp_update_sig.1,
+                poller_fut,
+            )),
             Background::new_sender(Self::kcp_async_send(io.clone(), kcp_sender.1)),
             Background::new_closer(Self::kcp_async_close(kcp_closer.1, kcp_manager.clone())),
             Background::new_reader(Self::kcp_async_recv(
@@ -105,15 +110,18 @@ where
             )),
         ];
 
+        let mut tasks = vec![];
+
         for process in processors {
             let kind = process.kind();
-            R::Runner::start(process)?;
+            tasks.push(R::Runner::start(process)?);
             log::trace!("kcp {:?} started", kind)
         }
 
         log::debug!("config: {:#?}", config);
 
         Ok(KcpListener {
+            tasks,
             manager: kcp_manager,
             kcp_receiver: acceptor.1,
             _marked: PhantomData,
@@ -430,5 +438,9 @@ impl<IO> Drop for KcpListener<IO> {
     fn drop(&mut self) {
         self.manager.close_all_session();
         self.manager.stop_all_processor();
+
+        for mut canceler in std::mem::replace(&mut self.tasks, Default::default()) {
+            canceler.cancel();
+        }
     }
 }

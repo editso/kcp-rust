@@ -19,6 +19,7 @@ pub use kcp::KcpConfig;
 pub use poller::Timer;
 pub use r#async::*;
 
+use signal::SigWrite;
 #[cfg(feature = "runtime_smol")]
 pub use smol::*;
 
@@ -64,6 +65,8 @@ pub enum TaskKind {
     Closer,
 }
 
+pub struct Canceler(SigWrite<()>);
+
 pub struct Background {
     kind: TaskKind,
     future: Pin<Box<dyn Future<Output = kcp::Result<()>> + Send + 'static>>,
@@ -76,7 +79,7 @@ background!(new_sender, Sender);
 
 pub trait Runner: Sized {
     type Err;
-    fn start(process: Background) -> std::result::Result<(), Self::Err>;
+    fn start(process: Background) -> std::result::Result<Canceler, Self::Err>;
 }
 
 pub trait KcpRuntime: Sized {
@@ -153,6 +156,18 @@ impl Default for Config {
             quebuf_size: 1024,
             kcp_config: kcp::FAST_MODE,
         }
+    }
+}
+
+impl Canceler {
+    pub fn cancel(&mut self) {
+        self.0.close();
+    }
+}
+
+impl Drop for Canceler {
+    fn drop(&mut self) {
+        self.cancel();
     }
 }
 

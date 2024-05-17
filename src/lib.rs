@@ -19,7 +19,7 @@ pub use kcp::KcpConfig;
 pub use poller::Timer;
 pub use r#async::*;
 
-use signal::SigWrite;
+use signal::{SigRead, SigWrite};
 #[cfg(feature = "runtime_smol")]
 pub use smol::*;
 
@@ -95,6 +95,13 @@ pub trait KcpRuntime: Sized {
 impl Background {
     pub fn kind(&self) -> TaskKind {
         self.kind
+    }
+}
+
+impl Canceler {
+    pub fn new() -> (Canceler, SigRead<()>) {
+        let (w, r) = signal::signal(1);
+        (Canceler(w), r)
     }
 }
 

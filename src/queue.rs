@@ -240,21 +240,15 @@ impl<T: Unpin> std::ops::DerefMut for WriteHalf<T> {
     }
 }
 
-impl<T: Unpin> Drop for ReadHalf<T> {
-    fn drop(&mut self) {
-        self.close();
-    }
-}
-
-impl<T: Unpin> Drop for WriteHalf<T> {
-    fn drop(&mut self) {
-        self.close();
-    }
-}
-
-impl<T: Unpin + Clone> Clone for WriteHalf<T>{
+impl<T: Unpin + Clone> Clone for WriteHalf<T> {
     fn clone(&self) -> Self {
         WriteHalf(self.0.clone())
+    }
+}
+
+impl<T: Unpin> Drop for QueueImpl<T> {
+    fn drop(&mut self) {
+        self.close();
     }
 }
 

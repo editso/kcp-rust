@@ -28,7 +28,7 @@ pub struct KcpConfig {
 pub const FAST_MODE: KcpConfig = KcpConfig {
     nc: true,
     mtu: 1400,
-    timeout: 15000,
+    timeout: 1500,
     nodelay: true,
     interval: 5,
     resend: 2,

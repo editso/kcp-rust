@@ -243,7 +243,12 @@ where
         mut io: IO,
     ) -> kcp::Result<()> {
         loop {
-            let data = snd_que.recv().await?;
+            
+            let data = snd_que.recv().await.map_err(|e| {
+                log::debug!("close ... {:?}", e);
+                e
+            })?;
+
             poll_fn(|cx| Pin::new(&mut io).poll_send(cx, &data)).await?;
         }
     }
